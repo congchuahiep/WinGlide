@@ -27,8 +27,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetAncestor, GetWindowTextW, IsWindowVisible, PostThreadMessageW, EVENT_OBJECT_CREATE,
-    EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW, GA_ROOT,
+    GetAncestor, GetWindowTextW, IsWindowVisible, PostThreadMessageW, EVENT_OBJECT_SHOW, GA_ROOT,
     INDEXID_CONTAINER, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
 };
 
@@ -38,10 +37,6 @@ use crate::uncombine::UncombineManager;
 ///
 /// `WM_USER + 0x100` đảm bảo không trùng với message hệ thống.
 pub const WM_APP_UNCOMBINE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 0x100;
-
-/// Custom message gửi từ WinEvent callback đến main thread khi cần invalidate cache
-/// (window bị đóng hoặc title thay đổi), không cần uncombine.
-pub const WM_APP_INVALIDATE_CACHE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 0x101;
 
 static HOOK_HANDLE: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 static MAIN_THREAD_ID: AtomicU32 = AtomicU32::new(0);
@@ -68,8 +63,8 @@ pub unsafe fn install_hook(uncombine: &'static UncombineManager) -> anyhow::Resu
     UNCOMBINE.store(uncombine as *const _ as *mut _, Ordering::SeqCst);
 
     let hook = SetWinEventHook(
-        EVENT_OBJECT_CREATE,
-        EVENT_OBJECT_HIDE,
+        EVENT_OBJECT_SHOW,
+        EVENT_OBJECT_SHOW,
         None,
         Some(win_event_proc),
         0,
@@ -82,7 +77,7 @@ pub unsafe fn install_hook(uncombine: &'static UncombineManager) -> anyhow::Resu
     }
 
     HOOK_HANDLE.store(hook.0, Ordering::SeqCst);
-    debug!("WinEvent hook installed (CREATE..NAMECHANGE)");
+    debug!("WinEvent hook installed (EVENT_OBJECT_SHOW)");
     Ok(())
 }
 
@@ -123,7 +118,7 @@ pub unsafe fn uninstall_hook() {
 /// ```
 unsafe extern "system" fn win_event_proc(
     _hook: HWINEVENTHOOK,
-    event: u32,
+    _event: u32,
     hwnd: HWND,
     id_object: i32,
     id_child: i32,
@@ -138,8 +133,26 @@ unsafe extern "system" fn win_event_proc(
         return;
     }
 
+    if !IsWindowVisible(hwnd).as_bool() {
+        return;
+    }
+
+    if GetAncestor(hwnd, GA_ROOT) != hwnd {
+        return;
+    }
+
+    let mut title_buf = [0u16; 256];
+    if GetWindowTextW(hwnd, &mut title_buf) == 0 {
+        return;
+    }
+
     let uncombine_ptr = UNCOMBINE.load(Ordering::SeqCst);
     if uncombine_ptr.is_null() {
+        return;
+    }
+
+    let uncombine = &*uncombine_ptr;
+    if uncombine.is_tracked(hwnd) {
         return;
     }
 
@@ -148,67 +161,11 @@ unsafe extern "system" fn win_event_proc(
         return;
     }
 
-    match event {
-        EVENT_OBJECT_CREATE | EVENT_OBJECT_SHOW => {
-            if !IsWindowVisible(hwnd).as_bool() {
-                return;
-            }
-            if GetAncestor(hwnd, GA_ROOT) != hwnd {
-                return;
-            }
-            let mut title_buf = [0u16; 256];
-            if GetWindowTextW(hwnd, &mut title_buf) == 0 {
-                return;
-            }
-
-            let uncombine = &*uncombine_ptr;
-            if uncombine.is_tracked(hwnd) {
-                return;
-            }
-
-            let _ = PostThreadMessageW(
-                thread_id,
-                WM_APP_UNCOMBINE,
-                WPARAM(hwnd.0 as usize),
-                LPARAM(0),
-            );
-        }
-        EVENT_OBJECT_HIDE => {
-            if GetAncestor(hwnd, GA_ROOT) != hwnd {
-                return;
-            }
-
-            let mut title_buf = [0u16; 256];
-            if GetWindowTextW(hwnd, &mut title_buf) == 0 {
-                return;
-            }
-
-            let _ = PostThreadMessageW(
-                thread_id,
-                WM_APP_INVALIDATE_CACHE,
-                WPARAM(hwnd.0 as usize),
-                LPARAM(EVENT_OBJECT_HIDE as isize),
-            );
-        }
-        EVENT_OBJECT_NAMECHANGE => {
-            if !IsWindowVisible(hwnd).as_bool() {
-                return;
-            }
-            if GetAncestor(hwnd, GA_ROOT) != hwnd {
-                return;
-            }
-            let mut title_buf = [0u16; 256];
-            if GetWindowTextW(hwnd, &mut title_buf) == 0 {
-                return;
-            }
-
-            let _ = PostThreadMessageW(
-                thread_id,
-                WM_APP_INVALIDATE_CACHE,
-                WPARAM(hwnd.0 as usize),
-                LPARAM(EVENT_OBJECT_NAMECHANGE as isize),
-            );
-        }
-        _ => {}
-    }
+    debug!("WinEvent: new window detected, hwnd={:?}", hwnd);
+    let _ = PostThreadMessageW(
+        thread_id,
+        WM_APP_UNCOMBINE,
+        WPARAM(hwnd.0 as usize),
+        LPARAM(0),
+    );
 }

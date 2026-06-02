@@ -1,9 +1,8 @@
 use nu_ansi_term::Color;
 use std::fmt::Write;
 use tracing::Level;
-use tracing_forest::printer::{Formatter, MakeStdout};
-use tracing_forest::tree::{Event, Span, Tree};
-use tracing_forest::Printer;
+use tracing_forest::printer::Formatter;
+use tracing_forest::tree::Tree;
 
 pub struct CleanFormatter;
 

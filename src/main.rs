@@ -2,6 +2,7 @@ mod hotkey;
 mod logging;
 mod switcher;
 mod taskbar;
+mod temp;
 mod uncombine;
 mod utils;
 mod winevent;
@@ -75,9 +76,9 @@ fn print_help(verbose: bool, uncombine_enabled: bool) {
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    let verbose = args.iter().any(|arg| arg == "-v" || arg == "--verbose");
+    let _verbose = args.iter().any(|arg| arg == "-v" || arg == "--verbose");
     let verbose = true;
-    let combine_enabled = args.iter().any(|a| a == "--combine-mode");
+    let _combine_enabled = args.iter().any(|a| a == "--combine-mode");
     let combine_enabled = false;
 
     print_help(verbose, combine_enabled);
@@ -157,18 +158,6 @@ fn main() -> anyhow::Result<()> {
                     if !combine_enabled {
                         uncombine.uncombine_one(hwnd, || {});
                     }
-                    enumerator.invalidate_cache();
-                }
-                winevent::WM_APP_INVALIDATE_CACHE => {
-                    let event_type = match msg.lParam.0 as u32 {
-                        0x8001 => "DESTROY",
-                        0x800C => "NAMECHANGE",
-                        _ => "UNKNOWN",
-                    };
-                    let hwnd = HWND(msg.wParam.0 as *mut _);
-                    let _guard = debug_span!("winevent", event = event_type).entered();
-                    debug!("hwnd={:?}", hwnd);
-                    enumerator.invalidate_cache();
                 }
                 _ => {}
             }

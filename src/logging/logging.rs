@@ -1,6 +1,6 @@
 use tracing::level_filters::LevelFilter;
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_forest::{tag::NoTag, ForestLayer, Printer, Tag};
+use tracing_forest::{ForestLayer, Printer, Tag};
 use tracing_subscriber::{fmt, prelude::*};
 
 use crate::logging::CleanFormatter;

@@ -49,13 +49,11 @@
 //! buttons.sort_by_key(|b| b.rect.left);
 //! ```
 
-use std::cell::RefCell;
-
 use tracing::{debug, instrument};
 use windows::core::w;
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+    CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::UI::Accessibility::{
@@ -116,19 +114,14 @@ pub struct TaskbarButton {
 /// Một window target trong danh sách cycle.
 /// Mỗi entry tương ứng với 1 window cụ thể (HWND),
 /// không phải 1 taskbar button.
-/// Dùng cho flat list cycling — grouped buttons được expand.
 #[derive(Debug, Clone)]
 pub struct CycleEntry {
     /// Tên hiển thị (window title)
     pub name: String,
     /// HWND của window cần activate
     pub hwnd: HWND,
-    /// Vị trí trái của taskbar button gốc (để sort theo thứ tự trái→phải)
-    pub taskbar_left: i32,
     /// Có thuộc grouped button không
     pub is_grouped: bool,
-    /// Vị trí window trên màn hình (dùng để sort windows trong group)
-    pub window_rect: RECT,
 }
 
 /// Result của việc enumerate taskbar buttons.
@@ -137,19 +130,6 @@ pub struct TaskbarEnumerator {
     ///
     /// Không implements `Send`/`Sync` vì COM objects không an toàn khi share cross-thread.
     automation: IUIAutomation,
-
-    /// Flag: đã tự init COM chưa.
-    ///
-    /// Nếu `true`, ta phải `CoUninitialize()` khi drop.
-    /// Nếu `false`, có thể COM đã được init sẵn bởi thread khác.
-    com_initialized: bool,
-
-    /// Cache danh sách taskbar buttons. `None` = chưa cache hoặc đã bị invalidate.
-    /// Tự động populate khi lần đầu gọi `cached_buttons()`, tồn tại cho đến khi `invalidate_cache()`.
-    button_cache: RefCell<Option<Vec<TaskbarButton>>>,
-
-    /// Cache danh sách visible windows (EnumWindows). Invalidated cùng lúc với button_cache.
-    window_cache: RefCell<Option<Vec<WindowInfo>>>,
 }
 
 impl TaskbarEnumerator {
@@ -173,17 +153,13 @@ impl TaskbarEnumerator {
     /// ```
     pub fn new() -> anyhow::Result<Self> {
         unsafe {
-            let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-            let com_initialized = hr.is_ok();
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
             let automation: IUIAutomation =
                 CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
 
             Ok(Self {
                 automation,
-                com_initialized,
-                button_cache: RefCell::new(None),
-                window_cache: RefCell::new(None),
             })
         }
     }
@@ -213,49 +189,6 @@ impl TaskbarEnumerator {
         unsafe { self.enumerate_buttons_for_hwnd(taskbar_hwnd) }
     }
 
-    /// Lấy danh sách buttons từ cache. Nếu cache trống, scan UIA và populate.
-    ///
-    /// Cache tồn tại vĩnh viễn cho đến khi `invalidate_cache()` được gọi
-    /// (qua WinEvent CREATE/DESTROY/NAMECHANGE).
-    fn cached_buttons(&self) -> anyhow::Result<Vec<TaskbarButton>> {
-        {
-            let cache = self.button_cache.borrow();
-            if let Some(ref buttons) = *cache {
-                return Ok(buttons.clone());
-            }
-        }
-
-        let buttons = self.enumerate_primary_buttons()?;
-        *self.button_cache.borrow_mut() = Some(buttons.clone());
-        Ok(buttons)
-    }
-
-    /// Lấy danh sách visible windows từ cache. Nếu cache trống, gọi EnumWindows và populate.
-    ///
-    /// Invalidated cùng lúc với button_cache qua `invalidate_cache()`.
-    fn cached_windows(&self) -> anyhow::Result<Vec<WindowInfo>> {
-        {
-            let cache = self.window_cache.borrow();
-            if let Some(ref windows) = *cache {
-                return Ok(windows.clone());
-            }
-        }
-
-        let windows = find_visible_windows();
-        *self.window_cache.borrow_mut() = Some(windows.clone());
-        Ok(windows)
-    }
-
-    /// Vô hiệu hoá toàn bộ cache (buttons + windows).
-    ///
-    /// Gọi khi có sự kiện thay đổi taskbar (window tạo/đóng/đổi title).
-    /// Lần cycle tiếp theo sẽ scan UIA và EnumWindows fresh.
-    pub fn invalidate_cache(&self) {
-        self.button_cache.borrow_mut().take();
-        self.window_cache.borrow_mut().take();
-        debug!("Cache invalidated");
-    }
-
     /// Tìm button kế tiếp (trái/phải) của foreground window và trả về window cần activate.
     ///
     /// # Khác với `build_cycle_entries`:
@@ -280,13 +213,13 @@ impl TaskbarEnumerator {
         combine_enabled: bool,
         direction: CycleDirection,
     ) -> anyhow::Result<Option<CycleEntry>> {
-        let buttons = self.cached_buttons()?;
+        let buttons = self.enumerate_primary_buttons()?;
 
         if buttons.is_empty() {
             return Ok(None);
         }
 
-        let all_windows = self.cached_windows()?;
+        let all_windows = find_visible_windows();
 
         let active_index =
             TaskbarEnumerator::find_active_button_index(&buttons, foreground, &all_windows)
@@ -316,115 +249,17 @@ impl TaskbarEnumerator {
             Ok(windows.into_iter().next().map(|w| CycleEntry {
                 name: w.title,
                 hwnd: w.hwnd,
-                taskbar_left: target_button.rect.left,
                 is_grouped,
-                window_rect: w.rect,
             }))
         } else {
             Ok(
                 find_window_for_button(&target_button, &all_windows).map(|w| CycleEntry {
                     name: w.title,
                     hwnd: w.hwnd,
-                    taskbar_left: target_button.rect.left,
                     is_grouped: false,
-                    window_rect: w.rect,
                 }),
             )
         }
-    }
-
-    /// Build danh sách cycle entries, mỗi entry là 1 window cụ thể.
-    ///
-    /// Grouped buttons (Combine mode ON) được expand thành nhiều entries, mỗi entry tương ứng với
-    /// 1 window riêng lẻ. _(WARN: Cơ chế cho group button hiện tại không chính xác, xem phần bên
-    /// dưới để biết lý do)_
-    ///
-    /// # Luồng
-    ///
-    /// 1. enumerate_primary_buttons() → lấy các taskbar buttons
-    /// 2. Với mỗi button → find_all_windows_for_button() → tìm windows
-    /// 3. Nếu button có 1 window → 1 CycleEntry
-    /// 4. Nếu button có N>1 windows (grouped) → N CycleEntries, sort theo window_rect.left _(WARN:
-    /// Cơ chế hiện tại không chính xác, xem phần bên dưới để biết lý do)_
-    /// 5. Sort tất cả entries theo taskbar_left (trái → phải)
-    ///
-    /// # Ví dụ output
-    ///
-    /// Với taskbar: [Settings] [Chrome(group: 3 windows)] [VScode] [Explorer]
-    ///
-    /// Output flat list:
-    /// ```text
-    /// [Settings#1, Chrome#1, Chrome#2, Chrome#3, VScode#1, Explorer#1]
-    /// ```
-    ///
-    /// # Thứ tự trong group
-    ///
-    /// Cơ chế hiện tại không chính xác: các cửa sổ trong một nhóm taskbar button đang được
-    /// sắp xếp theo ID của window (HWND). Vì vậy, thứ tự cửa sổ không khớp với thứ tự hiển thị trên
-    /// taskbar, mà chỉ theo ID nội bộ. Chi tiết hơn tại [`find_all_windows_for_button`].
-    #[instrument(level = "debug", skip_all)]
-    pub fn build_cycle_entries(&self, combine_enabled: bool) -> anyhow::Result<Vec<CycleEntry>> {
-        let buttons = self.cached_buttons()?;
-
-        // Cache: gọi EnumWindows 1 lần, dùng cho tất cả button
-        let all_windows = find_visible_windows();
-
-        let mut entries = Vec::new();
-
-        for button in &buttons {
-            match combine_enabled {
-                // Nếu combine_enabled là true, tìm các cửa sổ trong group button/không phải group
-                // button và thêm vào entries
-                true => {
-                    let windows = find_windows_for_button(button, &all_windows);
-
-                    let is_grouped = windows.len() > 1;
-
-                    for w in windows {
-                        entries.push(CycleEntry {
-                            name: w.title.clone(),
-                            hwnd: w.hwnd,
-                            taskbar_left: button.rect.left,
-                            is_grouped,
-                            window_rect: w.rect,
-                        });
-                    }
-                }
-                // Nếu combine_enabled là false, chỉ tìm cửa sổ duy nhất và thêm vào entries
-                false => {
-                    let window = find_window_for_button(button, &all_windows);
-
-                    match window {
-                        Some(w) => {
-                            entries.push(CycleEntry {
-                                name: w.title.clone(),
-                                hwnd: w.hwnd,
-                                taskbar_left: button.rect.left,
-                                is_grouped: false,
-                                window_rect: w.rect,
-                            });
-                        }
-                        None => {}
-                    }
-                }
-            }
-        }
-
-        entries.sort_by(|a, b| {
-            a.taskbar_left
-                .cmp(&b.taskbar_left)
-                .then_with(|| a.window_rect.left.cmp(&b.window_rect.left))
-                .then_with(|| a.hwnd.0.cmp(&b.hwnd.0))
-        });
-
-        for (i, e) in entries.iter().enumerate() {
-            debug!(
-                "Entry[{}]: name='{}', grouped={}, left={}",
-                i, e.name, e.is_grouped, e.taskbar_left
-            );
-        }
-
-        Ok(entries)
     }
 
     /// Core enumeration logic — tìm tất cả TaskListButtonAutomationPeer.

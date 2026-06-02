@@ -1,6 +1,5 @@
-use tracing::error;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_NOREPEAT, VK_OEM_4, VK_OEM_6,
+    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, VK_OEM_4, VK_OEM_6,
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
