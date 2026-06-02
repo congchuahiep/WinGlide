@@ -49,6 +49,8 @@
 //! buttons.sort_by_key(|b| b.rect.left);
 //! ```
 
+use std::cell::RefCell;
+
 use tracing::{debug, instrument};
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, RECT};
@@ -62,7 +64,16 @@ use windows::Win32::UI::Accessibility::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, FindWindowW};
 
-use crate::switcher::{find_window_for_button, find_windows_for_button};
+use crate::switcher::{
+    find_visible_windows, find_window_for_button_cached, find_windows_for_button_cached, WindowInfo,
+};
+
+/// Hướng cycle: trái hoặc phải trên taskbar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CycleDirection {
+    Forward,  // Alt+] — sang phải
+    Backward, // Alt+[ — sang trái
+}
 
 const TASKBAR_BUTTON_CLASS: &str = "Taskbar.TaskListButtonAutomationPeer";
 
@@ -132,6 +143,13 @@ pub struct TaskbarEnumerator {
     /// Nếu `true`, ta phải `CoUninitialize()` khi drop.
     /// Nếu `false`, có thể COM đã được init sẵn bởi thread khác.
     com_initialized: bool,
+
+    /// Cache danh sách taskbar buttons. `None` = chưa cache hoặc đã bị invalidate.
+    /// Tự động populate khi lần đầu gọi `cached_buttons()`, tồn tại cho đến khi `invalidate_cache()`.
+    button_cache: RefCell<Option<Vec<TaskbarButton>>>,
+
+    /// Cache danh sách visible windows (EnumWindows). Invalidated cùng lúc với button_cache.
+    window_cache: RefCell<Option<Vec<WindowInfo>>>,
 }
 
 impl TaskbarEnumerator {
@@ -164,6 +182,8 @@ impl TaskbarEnumerator {
             Ok(Self {
                 automation,
                 com_initialized,
+                button_cache: RefCell::new(None),
+                window_cache: RefCell::new(None),
             })
         }
     }
@@ -191,6 +211,135 @@ impl TaskbarEnumerator {
         let taskbar_hwnd = self.find_primary_taskbar_hwnd()?;
 
         unsafe { self.enumerate_buttons_for_hwnd(taskbar_hwnd) }
+    }
+
+    /// Lấy danh sách buttons từ cache. Nếu cache trống, scan UIA và populate.
+    ///
+    /// Cache tồn tại vĩnh viễn cho đến khi `invalidate_cache()` được gọi
+    /// (qua WinEvent CREATE/DESTROY/NAMECHANGE).
+    fn cached_buttons(&self) -> anyhow::Result<Vec<TaskbarButton>> {
+        {
+            let cache = self.button_cache.borrow();
+            if let Some(ref buttons) = *cache {
+                return Ok(buttons.clone());
+            }
+        }
+
+        let buttons = self.enumerate_primary_buttons()?;
+        *self.button_cache.borrow_mut() = Some(buttons.clone());
+        Ok(buttons)
+    }
+
+    /// Lấy danh sách visible windows từ cache. Nếu cache trống, gọi EnumWindows và populate.
+    ///
+    /// Invalidated cùng lúc với button_cache qua `invalidate_cache()`.
+    fn cached_windows(&self) -> anyhow::Result<Vec<WindowInfo>> {
+        {
+            let cache = self.window_cache.borrow();
+            if let Some(ref windows) = *cache {
+                return Ok(windows.clone());
+            }
+        }
+
+        let windows = find_visible_windows();
+        *self.window_cache.borrow_mut() = Some(windows.clone());
+        Ok(windows)
+    }
+
+    /// Vô hiệu hoá toàn bộ cache (buttons + windows).
+    ///
+    /// Gọi khi có sự kiện thay đổi taskbar (window tạo/đóng/đổi title).
+    /// Lần cycle tiếp theo sẽ scan UIA và EnumWindows fresh.
+    pub fn invalidate_cache(&self) {
+        self.button_cache.borrow_mut().take();
+        self.window_cache.borrow_mut().take();
+        debug!("Cache invalidated");
+    }
+
+    /// Tìm button kế tiếp (trái/phải) của foreground window và trả về window cần activate.
+    ///
+    /// # Khác với `build_cycle_entries`:
+    ///
+    /// - `build_cycle_entries`: xây **toàn bộ** danh sách (N buttons × M windows) → ~30ms
+    /// - `cycle_to_neighbor`: chỉ tìm button hiện tại + button kế bên + **1 window** → ~15ms
+    ///   (hoặc <1ms nếu buttons cache hợp lệ)
+    ///
+    /// # Tham số
+    ///
+    /// * `foreground`: HWND của cửa sổ đang focus
+    /// * `combine_enabled`: `true` = combine mode (button có thể nhóm); `false` = uncombined
+    /// * `direction`: `Forward` (phải) hoặc `Backward` (trái)
+    ///
+    /// # Returns
+    ///
+    /// `None` nếu không tìm thấy window phù hợp. `Some(CycleEntry)` nếu tìm thấy.
+    #[instrument(level = "debug", skip_all)]
+    pub fn cycle_to_neighbor(
+        &self,
+        foreground: HWND,
+        combine_enabled: bool,
+        direction: CycleDirection,
+    ) -> anyhow::Result<Option<CycleEntry>> {
+        let buttons = self.cached_buttons()?;
+
+        if buttons.is_empty() {
+            return Ok(None);
+        }
+
+        let all_windows = self.cached_windows()?;
+
+        let active_index =
+            TaskbarEnumerator::find_active_button_index(&buttons, foreground, &all_windows)
+                .unwrap_or(0);
+
+        debug!("Current index {active_index}");
+
+        let target_index = match direction {
+            CycleDirection::Forward if active_index + 1 >= buttons.len() => 0,
+            CycleDirection::Forward => active_index + 1,
+            CycleDirection::Backward if active_index == 0 => buttons.len() - 1,
+            CycleDirection::Backward => active_index - 1,
+        };
+
+        let target_button = &buttons[target_index];
+
+        debug!(
+            "Cycling {:?} from [{}] -> [{}] (button='{}')",
+            direction, active_index, target_index, target_button.name,
+        );
+
+        if combine_enabled {
+            let windows = find_windows_for_button_cached(
+                &target_button.name,
+                target_button.process_id,
+                target_button.automation_id.as_deref(),
+                &all_windows,
+            );
+
+            let is_grouped = windows.len() > 1;
+
+            Ok(windows.into_iter().next().map(|w| CycleEntry {
+                name: w.title,
+                hwnd: w.hwnd,
+                taskbar_left: target_button.rect.left,
+                is_grouped,
+                window_rect: w.rect,
+            }))
+        } else {
+            Ok(find_window_for_button_cached(
+                &target_button.name,
+                target_button.process_id,
+                target_button.automation_id.as_deref(),
+                &all_windows,
+            )
+            .map(|w| CycleEntry {
+                name: w.title,
+                hwnd: w.hwnd,
+                taskbar_left: target_button.rect.left,
+                is_grouped: false,
+                window_rect: w.rect,
+            }))
+        }
     }
 
     /// Build danh sách cycle entries, mỗi entry là 1 window cụ thể.
@@ -224,7 +373,10 @@ impl TaskbarEnumerator {
     /// taskbar, mà chỉ theo ID nội bộ. Chi tiết hơn tại [`find_all_windows_for_button`].
     #[instrument(level = "debug", skip_all)]
     pub fn build_cycle_entries(&self, combine_enabled: bool) -> anyhow::Result<Vec<CycleEntry>> {
-        let buttons = self.enumerate_primary_buttons()?;
+        let buttons = self.cached_buttons()?;
+
+        // Cache: gọi EnumWindows 1 lần, dùng cho tất cả button
+        let all_windows = find_visible_windows();
 
         let mut entries = Vec::new();
 
@@ -233,10 +385,11 @@ impl TaskbarEnumerator {
                 // Nếu combine_enabled là true, tìm các cửa sổ trong group button/không phải group
                 // button và thêm vào entries
                 true => {
-                    let windows = find_windows_for_button(
+                    let windows = find_windows_for_button_cached(
                         &button.name,
                         button.process_id,
                         button.automation_id.as_deref(),
+                        &all_windows,
                     );
 
                     let is_grouped = windows.len() > 1;
@@ -253,10 +406,11 @@ impl TaskbarEnumerator {
                 }
                 // Nếu combine_enabled là false, chỉ tìm cửa sổ duy nhất và thêm vào entries
                 false => {
-                    let window = find_window_for_button(
+                    let window = find_window_for_button_cached(
                         &button.name,
                         button.process_id,
                         button.automation_id.as_deref(),
+                        &all_windows,
                     );
 
                     match window {
@@ -516,80 +670,45 @@ impl TaskbarEnumerator {
         }
     }
 
-    /// Tìm index của taskbar button đang "active" (focused window thuộc app đó).
+    /// Tìm index của taskbar button tương ứng với foreground window.
     ///
-    /// # Active button là gì?
+    /// Sử dụng "reverse matching": với mỗi button, tìm các windows thuộc button đó
+    /// (qua AUMID, title, process name — logic đã kiểm chứng trong `match_windows_for_button_cached`),
+    /// rồi kiểm tra xem foreground HWND có nằm trong danh sách windows đó không.
     ///
-    /// Active button = nút trên taskbar tương ứng với cửa sổ đang ở foreground.
-    ///
-    /// Ví dụ: Đang focus vào VS Code window:
-    /// - Active button = nút "VS Code - 2 running windows"
-    ///
-    /// # Thuật toán
-    ///
-    /// 1. Lấy foreground window (window đang được focus)
-    /// 2. Từ foreground HWND → lấy UIA element
-    /// 3. Từ element → lấy PID và Name
-    /// 4. So khớp với danh sách buttons:
-    ///    - Ưu tiên 1: PID khớp (nếu không phải explorer.exe)
-    ///    - Ưu tiên 2: Name chứa nhau (fuzzy match)
-    ///
-    /// # Tại sao không dùng UIA Selection?
-    ///
-    /// IUIAutomation có `CurrentIsSelected` property, nhưng trên Win11 taskbar,
-    /// property này không always accurate hoặc available.
-    /// Nên ta fallback sang so khớp PID/Name.
-    pub fn find_active_button_index(
-        &self,
+    /// Phương pháp này đáng tin cậy hơn so với matching trực tiếp bằng UIA properties
+    /// vì button PID trên Win11 = explorer.exe (không phải app PID),
+    /// và window title không cùng format với button name.
+    fn find_active_button_index(
         buttons: &[TaskbarButton],
         foreground_hwnd: HWND,
+        all_windows: &[WindowInfo],
     ) -> Option<usize> {
-        unsafe {
-            // Lấy UIA element của foreground window
-            let fg_element = self.automation.ElementFromHandle(foreground_hwnd).ok()?;
+        let fg_info = all_windows.iter().find(|w| w.hwnd == foreground_hwnd);
+        let fg_name = fg_info.map(|w| w.title.as_str()).unwrap_or("<unknown>");
 
-            // Properties của foreground window
-            let fg_pid = fg_element.CurrentProcessId().ok().unwrap_or(-1);
-            let fg_name = fg_element
-                .CurrentName()
-                .ok()
-                .map(|b| b.to_string())
-                .unwrap_or_default();
+        for (i, button) in buttons.iter().enumerate() {
+            let windows = find_windows_for_button_cached(
+                &button.name,
+                button.process_id,
+                button.automation_id.as_deref(),
+                all_windows,
+            );
 
-            // Ưu tiên 1: PID khớp (nếu > 0 và không phải explorer)
-            //
-            // ⚠️ PID từ taskbar button thường = explorer.exe PID
-            // Nên check này thường fail trên Win11
-            for (i, button) in buttons.iter().enumerate() {
-                if button.process_id == fg_pid && fg_pid > 0 {
-                    return Some(i);
-                }
+            if windows.iter().any(|w| w.hwnd == foreground_hwnd) {
+                debug!(
+                    "Active button [{}]: '{}' matches foreground '{}'",
+                    i, button.name, fg_name
+                );
+                return Some(i);
             }
-
-            // Ưu tiên 2: Name fuzzy match
-            //
-            // Strip suffix trước khi so:
-            // "Chrome - 3 running windows" → "Chrome"
-            // "VS Code - main.rs" → "VS Code - main.rs"
-            let fg_clean = clean_button_name(&fg_name);
-
-            for (i, button) in buttons.iter().enumerate() {
-                let btn_clean = clean_button_name(&button.name);
-
-                // fg_clean chứa btn_clean HOẶC ngược lại
-                // Ví dụ:
-                // - fg_name = "main.rs - VS Code"
-                // - btn_name = "VS Code - 1 running window"
-                // → clean: "main.rs - VS Code" contains "VS Code" ✓
-                if !btn_clean.is_empty()
-                    && (fg_clean.contains(&btn_clean) || btn_clean.contains(&fg_clean))
-                {
-                    return Some(i);
-                }
-            }
-
-            None
         }
+
+        debug!(
+            "No button match found for foreground '{}' (HWND {:?})",
+            fg_name, foreground_hwnd
+        );
+        None
     }
 }
 

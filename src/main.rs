@@ -7,21 +7,17 @@ mod utils;
 mod winevent;
 
 use crate::hotkey::{HotkeyAction, HotkeyManager};
+use crate::uncombine::UncombineManager;
 use crate::utils::truncate;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use taskbar::TaskbarEnumerator;
-use tracing::{debug, error, info, instrument, warn};
+use taskbar::{CycleDirection, TaskbarEnumerator};
+use tracing::{debug, debug_span, error, info, instrument, warn};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetMessageW, PostThreadMessageW, WM_HOTKEY, WM_QUIT,
 };
-
-enum CycleDirection {
-    Forward,
-    Backward,
-}
 
 #[instrument(level = "debug", skip_all)]
 fn cycle_taskbar(
@@ -29,45 +25,26 @@ fn cycle_taskbar(
     combine_enabled: bool,
     direction: CycleDirection,
 ) -> anyhow::Result<()> {
-    let entries = enumerator.build_cycle_entries(combine_enabled)?;
-
-    if entries.is_empty() {
-        warn!("No cycle entries found");
-        return Ok(());
-    }
-
     let foreground = unsafe { GetForegroundWindow() };
 
-    let active_index = entries
-        .iter()
-        .position(|e| e.hwnd == foreground)
-        .unwrap_or(0);
+    let target = enumerator.cycle_to_neighbor(foreground, combine_enabled, direction)?;
 
-    let target_index = match direction {
-        CycleDirection::Forward if active_index + 1 >= entries.len() => 0,
-        CycleDirection::Forward => active_index + 1,
-        CycleDirection::Backward if active_index == 0 => entries.len() - 1,
-        CycleDirection::Backward => active_index - 1,
-    };
+    match target {
+        Some(entry) => {
+            debug!(
+                "Activating '{}' (grouped={})",
+                truncate(&entry.name, 30),
+                entry.is_grouped,
+            );
 
-    let target = &entries[target_index];
-
-    debug!(
-        "Cycling {} from [{}] '{}' -> [{}] '{}' (grouped={})",
-        match direction {
-            CycleDirection::Forward => "[Forward]",
-            CycleDirection::Backward => "[Backward]",
-        },
-        active_index,
-        truncate(&entries[active_index].name, 30),
-        target_index,
-        truncate(&target.name, 30),
-        target.is_grouped,
-    );
-
-    let ok = unsafe { switcher::force_activate(target.hwnd) };
-    if !ok {
-        warn!("force_activate returned false (foreground lock may be active)");
+            let ok = unsafe { switcher::force_activate(entry.hwnd) };
+            if !ok {
+                warn!("force_activate returned false (foreground lock may be active)");
+            }
+        }
+        None => {
+            warn!("No window found to cycle to");
+        }
     }
 
     Ok(())
@@ -112,7 +89,7 @@ fn main() -> anyhow::Result<()> {
     let r = running.clone();
 
     ctrlc::set_handler(move || {
-        info!("Ctrl-C received, restoring AppUserModelIDs...");
+        info!("Ctrl-C received, exiting...");
         r.store(false, Ordering::SeqCst);
         unsafe {
             let _ = PostThreadMessageW(
@@ -126,22 +103,24 @@ fn main() -> anyhow::Result<()> {
     .unwrap_or_else(|e| error!("Ctrl-C handler failed: {e}"));
 
     unsafe {
-        winevent::install_hook()?;
+        let uncombine: &'static UncombineManager = Box::leak(Box::new(UncombineManager::new()));
         let mut msg = std::mem::zeroed();
+        winevent::install_hook(uncombine)?;
 
         if !combine_enabled {
-            uncombine::uncombine_all_windows();
+            uncombine.uncombine_all();
         }
 
         while running.load(Ordering::SeqCst) {
             let result = GetMessageW(&mut msg, None, 0, 0);
 
             if result.0 == 0 {
+                // WM_QUIT — cleanup và thoát
                 winevent::uninstall_hook();
                 hotkey_manager.unregister_all();
 
                 if !combine_enabled {
-                    uncombine::restore_all_app_user_model_ids();
+                    uncombine.restore_all();
                 }
 
                 break;
@@ -169,9 +148,19 @@ fn main() -> anyhow::Result<()> {
                     }
                     None => continue,
                 },
-                winevent::WM_APP_UNCOMBINE if !combine_enabled => {
+                winevent::WM_APP_UNCOMBINE => {
                     let hwnd = HWND(msg.wParam.0 as *mut _);
-                    uncombine::uncombine_new_window(hwnd);
+                    let _guard = debug_span!("winevent", event = "UNCOMBINE").entered();
+                    debug!("hwnd={:?}", hwnd);
+                    if !combine_enabled {
+                        uncombine.uncombine_one(hwnd, || {});
+                    }
+                    enumerator.invalidate_cache();
+                }
+                winevent::WM_APP_INVALIDATE_CACHE => {
+                    let _guard = debug_span!("winevent", event = "INVALIDATE_CACHE").entered();
+                    debug!("Window destroyed or title changed");
+                    enumerator.invalidate_cache();
                 }
                 _ => {}
             }

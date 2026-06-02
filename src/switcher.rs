@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
-use tracing::{debug, error};
+use tracing::{debug, error, instrument};
 use windows::core::{BOOL, BSTR};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, TRUE};
 use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
@@ -17,6 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 /// Mở cửa sổ và đưa nó lên đầu danh sách cửa sổ (foreground)
+#[instrument(level = "debug", skip_all)]
 pub unsafe fn force_activate(target: HWND) -> bool {
     let foreground = GetForegroundWindow();
 
@@ -27,21 +28,18 @@ pub unsafe fn force_activate(target: HWND) -> bool {
     // Nếu minimize thì restore trước
     if IsIconic(target).as_bool() {
         let _ = ShowWindow(target, SW_RESTORE);
-        // Đợi restore hoàn tất
-        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
     // Cho phép foreground switch
     let _ = AllowSetForegroundWindow(ASFW_ANY);
 
-    // Fast path: thử trực tiếp
-    if SetForegroundWindow(target).as_bool() {
-        let _ = BringWindowToTop(target);
-        // Đợi foreground change hoàn tất
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        if GetForegroundWindow() == target {
-            return true;
-        }
+    // Thử trực tiếp
+    let _ = SetForegroundWindow(target);
+    let _ = BringWindowToTop(target);
+
+    // Kiểm tra ngay (không sleep)
+    if GetForegroundWindow() == target {
+        return true;
     }
 
     // Fallback: AttachThreadInput dance
@@ -55,11 +53,7 @@ pub unsafe fn force_activate(target: HWND) -> bool {
     if foreground_thread == 0 || foreground_thread == current_thread {
         let _ = BringWindowToTop(target);
         let _ = SetForegroundWindow(target);
-        // Đợi foreground change hoàn tất
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        if GetForegroundWindow() == target {
-            return true;
-        }
+        return GetForegroundWindow() == target;
     }
 
     let attached = AttachThreadInput(current_thread, foreground_thread, true).as_bool();
@@ -71,8 +65,6 @@ pub unsafe fn force_activate(target: HWND) -> bool {
         let _ = AttachThreadInput(current_thread, foreground_thread, false);
     }
 
-    // Đợi foreground change hoàn tất
-    std::thread::sleep(std::time::Duration::from_millis(50));
     GetForegroundWindow() == target
 }
 
@@ -233,12 +225,9 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> B
     TRUE
 }
 
-/// Tìm TẤT CẢ visible windows thuộc về một taskbar button.
+/// Core matching logic giữa một taskbar button và danh sách windows (cached).
 ///
-/// WARN: Cơ chế tìm kiếm taskbar button group hiện tại không chính xác: các cửa sổ trong một nhóm
-/// taskbar button đang được sắp xếp theo ID của window (HWND). Vì vậy, thứ tự cửa sổ không khớp với
-/// thứ tự hiển thị trên taskbar, mà chỉ theo ID nội bộ. Lời khuyên ở đây là người dùng nên luôn bật
-/// chế độ uncombine để đạt hiệu quả cao nhất.
+/// Không gọi `EnumWindows` — nhận `all_windows` từ caller để tránh scan lặp lại.
 ///
 /// # Thử 4 chiến lược matching theo thứ tự ưu tiên:
 /// 1. PID matching (nếu PID là app thực, không phải explorer)
@@ -247,20 +236,19 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> B
 /// 4. Process name matching (so khớp tên file thực thi với button name)
 ///
 /// # Returns
-/// Hàm này trả về danh sách các window đã được match với button. Vì button có thể là group nên nó
-/// trả về một danh sách, các window không phải là group sẽ chỉ có một phần tử trong danh sách này.
-fn match_windows_for_button(
+/// Danh sách windows matched — 1 phần tử nếu không phải group, N phần tử nếu group.
+fn match_windows_for_button_cached(
     button_name: &str,
     button_pid: i32,
     button_automation_id: Option<&str>,
+    all_windows: &[WindowInfo],
 ) -> Vec<WindowInfo> {
-    let windows = find_visible_windows();
     let explorer_pid = get_explorer_pid();
     let pid_is_real_app = button_pid > 0 && button_pid != explorer_pid as i32;
 
     // Thử 1: Match theo PID (nếu PID là app thực)
     if pid_is_real_app {
-        let pid_matches: Vec<WindowInfo> = windows
+        let pid_matches: Vec<WindowInfo> = all_windows
             .iter()
             .filter(|w| w.process_id == button_pid as u32 && !w.title.is_empty())
             .cloned()
@@ -292,7 +280,7 @@ fn match_windows_for_button(
     if let Some(auto_id) = button_automation_id {
         if !auto_id.is_empty() {
             let auto_id_lower = auto_id.to_lowercase();
-            let appid_matches: Vec<WindowInfo> = windows
+            let appid_matches: Vec<WindowInfo> = all_windows
                 .iter()
                 .filter(|w| {
                     if w.title.is_empty() {
@@ -339,7 +327,7 @@ fn match_windows_for_button(
         return Vec::new();
     }
 
-    let title_matches: Vec<WindowInfo> = windows
+    let title_matches: Vec<WindowInfo> = all_windows
         .iter()
         .filter(|w| {
             if w.title.is_empty() {
@@ -372,7 +360,7 @@ fn match_windows_for_button(
     // Thử 4: Match theo process name
     // VD: button "Edge" → process "msedge.exe" → "msedge" contains "edge" ✓
     let clean_name_lower = clean_name.to_lowercase();
-    let process_matches: Vec<WindowInfo> = windows
+    let process_matches: Vec<WindowInfo> = all_windows
         .iter()
         .filter(|w| {
             if w.title.is_empty() {
@@ -413,12 +401,26 @@ fn match_windows_for_button(
 ///
 /// Nếu cần tìm kiếm window trong một button group, sử dụng [`find_windows_for_button`] thay vì
 /// [`find_window_for_button`].
+///
+/// Gọi `EnumWindows` mỗi lần gọi. Dùng [`find_window_for_button_cached`] nếu đã có danh sách windows.
 pub fn find_window_for_button(
     button_name: &str,
     button_pid: i32,
     button_automation_id: Option<&str>,
 ) -> Option<WindowInfo> {
-    match_windows_for_button(button_name, button_pid, button_automation_id)
+    let all_windows = find_visible_windows();
+    find_window_for_button_cached(button_name, button_pid, button_automation_id, &all_windows)
+}
+
+/// Giống [`find_window_for_button`] nhưng nhận danh sách windows đã cache từ trước.
+/// Tránh gọi `EnumWindows` lặp lại khi duyệt nhiều button.
+pub fn find_window_for_button_cached(
+    button_name: &str,
+    button_pid: i32,
+    button_automation_id: Option<&str>,
+    all_windows: &[WindowInfo],
+) -> Option<WindowInfo> {
+    match_windows_for_button_cached(button_name, button_pid, button_automation_id, all_windows)
         .into_iter()
         .next()
 }
@@ -429,14 +431,25 @@ pub fn find_window_for_button(
 /// Nếu không cần kiểm tra button group, sử dụng [`find_window_for_button`] thay vì
 /// [`find_windows_for_button`].
 ///
-/// WARN: Cơ chế tìm group window hiện tại đang không đúng, xem [`match_windows_for_button`] để
-/// biết thêm.
+/// Gọi `EnumWindows` mỗi lần gọi. Dùng [`find_windows_for_button_cached`] nếu đã có cache.
 pub fn find_windows_for_button(
     button_name: &str,
     button_pid: i32,
     button_automation_id: Option<&str>,
 ) -> Vec<WindowInfo> {
-    match_windows_for_button(button_name, button_pid, button_automation_id)
+    let all_windows = find_visible_windows();
+    find_windows_for_button_cached(button_name, button_pid, button_automation_id, &all_windows)
+}
+
+/// Giống [`find_windows_for_button`] nhưng nhận danh sách windows đã cache từ trước.
+/// Tránh gọi `EnumWindows` lặp lại khi duyệt nhiều button.
+pub fn find_windows_for_button_cached(
+    button_name: &str,
+    button_pid: i32,
+    button_automation_id: Option<&str>,
+    all_windows: &[WindowInfo],
+) -> Vec<WindowInfo> {
+    match_windows_for_button_cached(button_name, button_pid, button_automation_id, all_windows)
 }
 
 fn get_explorer_pid() -> u32 {
