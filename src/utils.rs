@@ -30,3 +30,17 @@ pub fn clean_button_name(name: &str) -> String {
 
     name.to_string()
 }
+
+pub fn is_system_class(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "Progman" | "WorkerW" |  // Desktop
+        "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" |  // Taskbar
+        "Windows.UI.Composition.DesktopWindowContentBridge" |  // XAML bridge
+        "ApplicationFrame" |  // UWP frame
+        "IME" | "MSCTFIME UI" | "IMEUI" |  // IME
+        "tooltips_class32" |  // Tooltips
+        "DwmWindowComposition" |  // DWM
+        "SysAnimate32" // Animation
+    )
+}

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
 use tracing::{debug, error, instrument};
 use windows::core::{BOOL, BSTR};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, TRUE};
@@ -12,12 +12,13 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindowRect,
-    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetForegroundWindow,
-    ShowWindow, ASFW_ANY, SW_RESTORE,
+    AllowSetForegroundWindow, BringWindowToTop, EnumWindows, GetClassNameW, GetForegroundWindow,
+    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    SetForegroundWindow, ShowWindow, ASFW_ANY, SW_RESTORE,
 };
 
 use crate::types::{TaskbarButton, WindowInfo};
+use crate::utils::is_system_class;
 
 struct EnumData {
     windows: Vec<WindowInfo>,
@@ -181,16 +182,24 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> B
         return TRUE;
     }
 
-    let mut title_buf = [0u16; 512];
-    let len = GetWindowTextW(hwnd, &mut title_buf);
-    if len == 0 {
-        return TRUE;
+    let mut class_buf = [0u16; 256];
+    let class_len = unsafe { GetClassNameW(hwnd, &mut class_buf) };
+    if class_len > 0 {
+        let class_name = String::from_utf16_lossy(&class_buf[..class_len as usize]);
+        // Bỏ qua system windows
+        if is_system_class(&class_name) {
+            return TRUE;
+        }
     }
 
-    let title = String::from_utf16_lossy(&title_buf[..len as usize]);
-    if title.is_empty() {
-        return TRUE;
-    }
+    // Cho phép title rỗng (VD: Gemini floating window)
+    let mut title_buf = [0u16; 512];
+    let len = GetWindowTextW(hwnd, &mut title_buf);
+    let title = if len == 0 {
+        String::new()
+    } else {
+        String::from_utf16_lossy(&title_buf[..len as usize])
+    };
 
     let mut pid: u32 = 0;
     GetWindowThreadProcessId(hwnd, Some(&mut pid));
@@ -212,7 +221,6 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> B
         rect,
         process_name,
         process_id: pid,
-        app_user_model_id: None,
     });
 
     TRUE
@@ -269,9 +277,9 @@ fn match_windows_for_button(button: &TaskbarButton, all_windows: &[WindowInfo]) 
             let appid_matches: Vec<WindowInfo> = all_windows
                 .iter()
                 .filter(|w| {
-                    if w.title.is_empty() {
-                        return false;
-                    }
+                    // if w.title.is_empty() {
+                    //     return false;
+                    // }
                     let window_aumid = match get_app_user_model_id(w.hwnd) {
                         Some(aumid) => aumid,
                         None => return false, // filter closure return
@@ -343,13 +351,13 @@ fn match_windows_for_button(button: &TaskbarButton, all_windows: &[WindowInfo]) 
         return sorted;
     }
 
-    // Thử 4: Match theo process name
-    // VD: button "Edge" → process "msedge.exe" → "msedge" contains "edge" ✓
+    // Thử 4: Match theo process name — cho phép window có title rỗng
+    // (VD: Chrome Gemini floating window có title="" nhưng process="chrome.exe")
     let clean_name_lower = clean_name.to_lowercase();
     let process_matches: Vec<WindowInfo> = all_windows
         .iter()
         .filter(|w| {
-            if w.title.is_empty() {
+            if w.process_name.is_empty() {
                 return false;
             }
             let proc_lower = w.process_name.to_lowercase();
@@ -378,7 +386,30 @@ fn match_windows_for_button(button: &TaskbarButton, all_windows: &[WindowInfo]) 
         return sorted;
     }
 
-    error!("Cannot find windows cause there no clue left: !PID, !AppUserModelID, !title, !process");
+    debug!(
+        "Button '{}' matching failed: pid_is_real={}, explorer_pid={}, button_pid={}, \
+         auto_id={:?}, clean_name='{}'",
+        button.name,
+        pid_is_real_app,
+        explorer_pid,
+        button.process_id,
+        button.automation_id,
+        clean_name,
+    );
+
+    for w in all_windows.iter() {
+        if w.title.to_lowercase().contains(&clean_name.to_lowercase())
+            || w.process_name
+                .to_lowercase()
+                .contains(&clean_name.to_lowercase())
+        {
+            debug!(
+                "Candidate: title='{}' process='{}' pid={} hwnd={:?}",
+                w.title, w.process_name, w.process_id, w.hwnd
+            );
+        }
+    }
+
     Vec::new()
 }
 
@@ -408,31 +439,44 @@ pub fn find_windows_for_button(
     match_windows_for_button(button, all_windows)
 }
 
-/// Lấy PID của explorer.exe từ tasklist.
+/// Lấy PID của explorer.exe.
+///
+/// Cache bằng atomic — valid đến khi [`invalidate_explorer_pid_cache()`] được gọi
+/// (từ `TaskbarEnumerator::refresh_taskbar_hwnd()` khi explorer restart).
 fn get_explorer_pid() -> u32 {
     use std::process::Command;
-    static EXPLORER_PID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
-    *EXPLORER_PID.get_or_init(|| {
-        // Lấy PID của explorer.exe
-        if let Ok(output) = Command::new("tasklist")
-            .args(["/FI", "IMAGENAME eq explorer.exe", "/FO", "CSV", "/NH"])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Format: "explorer.exe","1234","Console","1","45,678 K"
-            for line in stdout.lines() {
-                if line.contains("explorer.exe") {
-                    let parts: Vec<&str> = line.split(',').collect();
-                    if parts.len() >= 2 {
-                        let pid_str = parts[1].trim_matches('"').trim();
-                        if let Ok(pid) = pid_str.parse::<u32>() {
-                            return pid;
-                        }
-                    }
-                }
-            }
-        }
+    if EXPLORER_PID_VALID.load(Ordering::Relaxed) {
+        return EXPLORER_PID_CACHE.load(Ordering::Relaxed);
+    }
+
+    let pid = if let Ok(output) = Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq explorer.exe", "/FO", "CSV", "/NH"])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout
+            .lines()
+            .find(|l| l.contains("explorer.exe"))
+            .and_then(|l| l.split(',').nth(1))
+            .and_then(|s| s.trim_matches('"').trim().parse().ok())
+            .unwrap_or(0)
+    } else {
         0
-    })
+    };
+
+    EXPLORER_PID_CACHE.store(pid, Ordering::Relaxed);
+    EXPLORER_PID_VALID.store(true, Ordering::Relaxed);
+    pid
 }
+
+/// Invalidate explorer PID cache — gọi khi explorer restart.
+pub fn invalidate_explorer_pid_cache() {
+    EXPLORER_PID_VALID.store(false, Ordering::Relaxed);
+    debug!("Explorer PID cache invalidated");
+}
+
+// ── Explorer PID cache — module-level để cả get_explorer_pid() và
+//    invalidate_explorer_pid_cache() cùng truy cập ──
+static EXPLORER_PID_VALID: AtomicBool = AtomicBool::new(false);
+static EXPLORER_PID_CACHE: AtomicU32 = AtomicU32::new(0);

@@ -52,11 +52,7 @@ impl App {
     /// Phải gọi trên main thread (STA). Hooks dùng unsafe COM/Win32 APIs.
     pub unsafe fn run(&self, main_thread_id: u32) -> anyhow::Result<()> {
         let _win_hook = event::WinEventHook::install(self.uncombine_manager)?;
-        let _uia_hook = event::UiaEventHook::install(
-            self.enumerator.automation(),
-            self.enumerator.taskbar_hwnd(),
-            main_thread_id,
-        )?;
+        self.enumerator.install_uia_hook(main_thread_id)?;
 
         if !self.combine_enabled {
             self.uncombine_manager.uncombine_all();
@@ -84,7 +80,7 @@ impl App {
             }
         }
 
-        // RAII: _win_hook và _uia_hook tự Drop ở đây
+        // RAII: _win_hook tự Drop ở đây, uia_hook được drop bởi enumerator
         self.hotkey_manager.unregister_all();
         if !self.combine_enabled {
             self.uncombine_manager.restore_all();

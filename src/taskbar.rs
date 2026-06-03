@@ -49,9 +49,9 @@
 //! buttons.sort_by_key(|b| b.rect.left);
 //! ```
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::time::Instant;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, error, instrument, warn};
 use windows::core::w;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::{
@@ -69,6 +69,7 @@ use windows::Win32::UI::Shell::IVirtualDesktopManager;
 use windows::Win32::UI::Shell::VirtualDesktopManager;
 use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, FindWindowW, GetForegroundWindow};
 
+use crate::event::UiaEventHook;
 use crate::switcher::{find_visible_windows, find_window_for_button, find_windows_for_button};
 use crate::types::{TaskbarButton, WindowInfo};
 use crate::utils::truncate;
@@ -121,7 +122,17 @@ pub struct TaskbarEnumerator {
     last_desktop_id: RefCell<Option<windows::core::GUID>>,
 
     /// HWND của taskbar window.
-    taskbar_hwnd: HWND,
+    ///
+    /// Dùng `Cell` để có thể cập nhật khi explorer restart mà không cần `&mut self`.
+    taskbar_hwnd: Cell<HWND>,
+
+    /// UIA StructureChanged event hook — tự subscribe/unsubscribe.
+    ///
+    /// Khi explorer restart, `refresh_taskbar_hwnd()` sẽ drop old + create new.
+    uia_hook: RefCell<Option<UiaEventHook>>,
+
+    /// Main thread ID — dùng để re-subscribe UIA events sau explorer restart.
+    uia_thread_id: Cell<u32>,
 }
 
 impl TaskbarEnumerator {
@@ -157,9 +168,11 @@ impl TaskbarEnumerator {
 
             Ok(Self {
                 automation,
-                taskbar_hwnd,
+                taskbar_hwnd: Cell::new(taskbar_hwnd),
                 button_cache: RefCell::new(None),
                 last_desktop_id: RefCell::new(None),
+                uia_hook: RefCell::new(None),
+                uia_thread_id: Cell::new(0),
             })
         }
     }
@@ -184,7 +197,7 @@ impl TaskbarEnumerator {
         }
 
         unsafe {
-            let buttons = self.enumerate_buttons_for_hwnd()?;
+            let buttons = self.enumerate_buttons()?;
             *self.button_cache.borrow_mut() = Some(ButtonCache {
                 buttons: buttons.clone(),
                 created_at: Instant::now(),
@@ -227,8 +240,7 @@ impl TaskbarEnumerator {
         changed
     }
 
-    /// Invalidate button cache — gọi khi nhận UIA StructureChanged event hoặc
-    /// WinEvent từ taskbar.
+    /// Invalidate button cache — gọi khi nhận UIA StructureChanged event.
     ///
     /// UIA event (ChildAdded, ChildRemoved, ...) từ taskbar báo hiệu
     /// rằng button list có thể đã thay đổi. Cache phải bị invalidate
@@ -241,14 +253,49 @@ impl TaskbarEnumerator {
         }
     }
 
-    /// Expose `IUIAutomation` reference — dùng bởi UiaEventHook.
-    pub fn automation(&self) -> &IUIAutomation {
-        &self.automation
+    /// Đăng ký UIA StructureChanged event handler trên taskbar element.
+    ///
+    /// Gọi 1 lần từ `App::run()`. Sau khi explorer restart, `refresh_taskbar_hwnd()` tự động
+    /// re-subscribe
+    pub fn install_uia_hook(&self, main_thread_id: u32) -> anyhow::Result<()> {
+        self.uia_thread_id.set(main_thread_id);
+        let hook = unsafe {
+            UiaEventHook::install(&self.automation, self.taskbar_hwnd.get(), main_thread_id)?
+        };
+        *self.uia_hook.borrow_mut() = Some(hook);
+        Ok(())
     }
 
-    /// Expose taskbar HWND — dùng bởi UiaEventHook.
-    pub fn taskbar_hwnd(&self) -> HWND {
-        self.taskbar_hwnd
+    /// Tự phục hồi sau khi explorer.exe crash và restart.
+    ///
+    /// 1. Tìm Shell_TrayWnd mới (HWND thay đổi sau crash)
+    /// 2. Drop UIA event hook cũ, subscribe vào element mới
+    /// 3. Invalidate button cache
+    pub fn refresh_taskbar_hwnd(&self) -> anyhow::Result<()> {
+        let new_hwnd = unsafe { FindWindowW(w!("Shell_TrayWnd"), None) }?;
+        if new_hwnd.0.is_null() {
+            anyhow::bail!("Shell_TrayWnd not found after explorer restart");
+        }
+
+        self.taskbar_hwnd.set(new_hwnd);
+        self.invalidate_cache();
+        crate::switcher::invalidate_explorer_pid_cache();
+
+        *self.uia_hook.borrow_mut() = None;
+        let hook =
+            unsafe { UiaEventHook::install(&self.automation, new_hwnd, self.uia_thread_id.get())? };
+        *self.uia_hook.borrow_mut() = Some(hook);
+
+        debug!(
+            "Taskbar HWND refreshed to {:?}, UIA re-subscribed",
+            new_hwnd
+        );
+        Ok(())
+    }
+
+    /// Kiểm tra lỗi có phải EVENT_E_ALL_SUBSCRIBERS_FAILED (0x80040201) không.
+    fn is_subscribers_failed(e: &anyhow::Error) -> bool {
+        e.chain().any(|c| c.to_string().contains("0x80040201"))
     }
 
     /// Cycle đến window kế tiếp (dựa trên vị trí trái/phải của taskbar button đang được active) và
@@ -265,14 +312,14 @@ impl TaskbarEnumerator {
         let target = self.find_neighbor_window(foreground, combine_enabled, direction)?;
 
         match target {
-            Some(entry) => {
+            Some(target) => {
                 debug!(
                     "Activating '{}' (grouped={})",
-                    truncate(&entry.name, 30),
-                    entry.is_grouped,
+                    truncate(&target.name, 30),
+                    target.is_grouped,
                 );
 
-                let ok = unsafe { crate::switcher::force_activate(entry.hwnd) };
+                let ok = unsafe { crate::switcher::force_activate(target.hwnd) };
                 if !ok {
                     warn!("force_activate returned false");
                 }
@@ -310,44 +357,45 @@ impl TaskbarEnumerator {
 
         let all_windows = find_visible_windows();
 
-        let active_index =
+        let source_index =
             TaskbarEnumerator::find_active_button_index(&buttons, source, &all_windows)
                 .unwrap_or(0);
 
-        debug!("Current index {active_index}");
-
         let target_index = match direction {
-            CycleDirection::Forward if active_index + 1 >= buttons.len() => 0,
-            CycleDirection::Forward => active_index + 1,
-            CycleDirection::Backward if active_index == 0 => buttons.len() - 1,
-            CycleDirection::Backward => active_index - 1,
+            CycleDirection::Forward if source_index + 1 >= buttons.len() => 0,
+            CycleDirection::Forward => source_index + 1,
+            CycleDirection::Backward if source_index == 0 => buttons.len() - 1,
+            CycleDirection::Backward => source_index - 1,
         };
 
         let target_button = &buttons[target_index];
 
-        debug!(
-            "Cycling {:?} from [{}] -> [{}] (button='{}')",
-            direction, active_index, target_index, target_button.name,
-        );
+        match combine_enabled {
+            true => {
+                let windows = find_windows_for_button(&target_button, &all_windows);
 
-        if combine_enabled {
-            let windows = find_windows_for_button(&target_button, &all_windows);
+                let is_grouped = windows.len() > 1;
 
-            let is_grouped = windows.len() > 1;
-
-            Ok(windows.into_iter().next().map(|w| TargetWindow {
-                name: w.title,
-                hwnd: w.hwnd,
-                is_grouped,
-            }))
-        } else {
-            Ok(
-                find_window_for_button(&target_button, &all_windows).map(|w| TargetWindow {
+                Ok(windows.into_iter().next().map(|w| TargetWindow {
                     name: w.title,
                     hwnd: w.hwnd,
-                    is_grouped: false,
-                }),
-            )
+                    is_grouped,
+                }))
+            }
+            false => {
+                debug!(
+                    "Target button [{}]: '{}' AUMID '{:?}'",
+                    target_index, target_button.name, target_button.automation_id
+                );
+
+                Ok(
+                    find_window_for_button(&target_button, &all_windows).map(|w| TargetWindow {
+                        name: w.title,
+                        hwnd: w.hwnd,
+                        is_grouped: false,
+                    }),
+                )
+            }
         }
     }
 
@@ -368,14 +416,36 @@ impl TaskbarEnumerator {
         Ok(cache)
     }
 
-    /// Core enumeration logic, tìm tất cả TaskListButtonAutomationPeer
-    ///
-    /// Dùng `FindAllBuildCache` thay vì `FindAll` để batch property reads. Thay vì 4 COM calls
-    /// button (CurrentName, CurrentBoundingRectangle, ...), UIA lấy tất cả properties trong 1 lần
-    /// tree traversal
+    /// Tìm kiếm và liệt kê các taskbar buttons. Nếu taskbar HWND không còn tồn tại, sẽ thử khôi
+    /// phục và tìm kiếm lại taskbar HWND
     #[instrument(level = "debug", skip_all)]
-    unsafe fn enumerate_buttons_for_hwnd(&self) -> anyhow::Result<Vec<TaskbarButton>> {
-        let taskbar_hwnd = self.taskbar_hwnd;
+    unsafe fn enumerate_buttons(&self) -> anyhow::Result<Vec<TaskbarButton>> {
+        match self.try_enumerate_buttons() {
+            Ok(buttons) => Ok(buttons),
+            Err(ref e) if Self::is_subscribers_failed(e) => {
+                warn!("UIA subscribers failed (explorer restart?), recovering...");
+                self.refresh_taskbar_hwnd().map_err(|e2| {
+                    error!("Failed to recover taskbar: {e2}");
+                    anyhow::anyhow!("{e}")
+                })?;
+                self.try_enumerate_buttons()
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// (internal helper) Tìm kiếm và liệt kê các taskbar buttons
+    ///
+    /// **Lưu ý quan trọng:** Nên sử dụng `enumerate_buttons` thay thế hàm này. Vì nó được thiết
+    /// kế để chỉ được gọi bên trong `enumerate_buttons`
+    ///
+    /// Hàm này có thể trả về lỗi trực tiếp từ hệ thống trong các trường hợp:
+    /// - Taskbar HWND không còn tồn tại
+    /// - Không thể tạo condition cho UIA
+    /// - Không thể lấy root element từ HWND
+    /// - Không thể tìm kiếm các items trên taskbar
+    unsafe fn try_enumerate_buttons(&self) -> anyhow::Result<Vec<TaskbarButton>> {
+        let taskbar_hwnd = self.taskbar_hwnd.get();
         let class_condition = self.automation.CreatePropertyCondition(
             UIA_ClassNamePropertyId,
             &VARIANT::from("Taskbar.TaskListButtonAutomationPeer"),
@@ -436,7 +506,6 @@ impl TaskbarEnumerator {
             };
 
             let process_id = item.CachedProcessId().unwrap_or(0);
-
             let automation_id = item.CachedAutomationId().ok().map(|s| s.to_string());
 
             buttons.push(TaskbarButton {
@@ -512,7 +581,7 @@ impl TaskbarEnumerator {
     /// Tìm index của taskbar button tương ứng với foreground window.
     ///
     /// Sử dụng "reverse matching": với mỗi button, tìm các windows thuộc button đó
-    /// (qua AUMID, title, process name — logic đã kiểm chứng trong `match_windows_for_button_cached`),
+    /// (qua AUMID, title, process name, logic đã kiểm chứng trong `match_windows_for_button`),
     /// rồi kiểm tra xem foreground HWND có nằm trong danh sách windows đó không.
     ///
     /// Phương pháp này đáng tin cậy hơn so với matching trực tiếp bằng UIA properties
@@ -527,21 +596,18 @@ impl TaskbarEnumerator {
         let fg_name = fg_info.map(|w| w.title.as_str()).unwrap_or("<unknown>");
 
         // Fast path: match foreground AUMID với button automation_id
-        // Tránh duyệt tất cả windows cho mỗi button — chỉ 1 COM call
+        // Tránh duyệt tất cả windows cho mỗi button, chỉ 1 COM call
         if let Some(fg_aumid) = crate::switcher::get_app_user_model_id(foreground_hwnd) {
             let fg_aumid_lower = fg_aumid.to_lowercase();
             for (i, button) in buttons.iter().enumerate() {
-                if let Some(auto_id) = &button.automation_id {
-                    if !auto_id.is_empty() {
-                        let auto_id_lower = auto_id.to_lowercase();
+                if let Some(amuid) = &button.automation_id {
+                    if !amuid.is_empty() {
+                        let auto_id_lower = amuid.to_lowercase();
                         if auto_id_lower == fg_aumid_lower
                             || fg_aumid_lower.starts_with(&auto_id_lower)
                             || auto_id_lower.contains(&fg_aumid_lower)
                         {
-                            debug!(
-                                "Active button [{}]: '{}' fast-match AUMID '{}' vs fg AUMID '{}'",
-                                i, button.name, auto_id, fg_aumid
-                            );
+                            debug!("Active button [{}]: '{}' AUMID '{}'", i, button.name, amuid);
                             return Some(i);
                         }
                     }

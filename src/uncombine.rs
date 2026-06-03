@@ -119,7 +119,11 @@ impl UncombineManager {
             map.insert(hwnd_val, original.clone());
 
             match set_aumid(w.hwnd, &new_aumid) {
-                Ok(()) => debug!("'{}' has been uncombined", truncate(&w.title, 30),),
+                Ok(()) => debug!(
+                    "'{}' has been uncombined ({})",
+                    truncate(&w.title, 30),
+                    get_aumid(w.hwnd).as_deref().unwrap_or("None")
+                ),
                 Err(e) => error!(
                     "Failed to set AUMID for {}: {:?}",
                     truncate(&w.title, 30),

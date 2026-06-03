@@ -19,7 +19,7 @@ pub struct TaskbarButton {
     /// PID của process sở hữu button (thường là explorer.exe trên Win11)
     pub process_id: i32,
 
-    /// Automation ID từ UIA, có thể chứa AppUserModelID
+    /// Automation ID từ UIA, 99% nó là AppUserModelID
     pub automation_id: Option<String>,
 }
 
@@ -40,7 +40,4 @@ pub struct WindowInfo {
 
     /// Tên file thực thi (VD: "chrome.exe")
     pub process_name: String,
-
-    /// AppUserModelID — dùng để match với taskbar button automation_id
-    pub app_user_model_id: Option<String>,
 }

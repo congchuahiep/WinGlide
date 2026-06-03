@@ -12,11 +12,13 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetAncestor, GetWindowTextW, IsWindowVisible, PostThreadMessageW, EVENT_OBJECT_SHOW, GA_ROOT,
-    INDEXID_CONTAINER, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    GetAncestor, GetClassNameW, GetWindowTextW, IsWindowVisible, PostThreadMessageW,
+    EVENT_OBJECT_SHOW, GA_ROOT, INDEXID_CONTAINER, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS,
 };
 
 use crate::uncombine::UncombineManager;
+use crate::utils::is_system_class;
 
 pub const WM_APP_UNCOMBINE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 0x100;
 
@@ -96,9 +98,13 @@ unsafe extern "system" fn win_event_proc(
         return;
     }
 
-    let mut title_buf = [0u16; 256];
-    if GetWindowTextW(hwnd, &mut title_buf) == 0 {
-        return;
+    let mut class_buf = [0u16; 256];
+    let class_len = GetClassNameW(hwnd, &mut class_buf);
+    if class_len > 0 {
+        let class_name = String::from_utf16_lossy(&class_buf[..class_len as usize]);
+        if is_system_class(&class_name) {
+            return;
+        }
     }
 
     let thread_id = MAIN_THREAD_ID.load(Ordering::SeqCst);
