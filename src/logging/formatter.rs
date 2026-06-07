@@ -1,8 +1,11 @@
 use nu_ansi_term::Color;
-use std::fmt::Write;
+use std::{fmt::Write, sync::atomic::Ordering};
 use tracing::Level;
 use tracing_forest::printer::Formatter;
 use tracing_forest::tree::Tree;
+use tracing_subscriber::fmt::MakeWriter;
+
+use crate::logging::console::{CONSOLE_PIPE, CONSOLE_VISIBLE};
 
 pub struct CleanFormatter;
 
@@ -155,5 +158,66 @@ impl std::fmt::Display for ColorLevel {
         };
         let style = color.bold();
         write!(f, "{}{:<6}{}", style.prefix(), self.0, style.suffix())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MakeWriter implementation cho tracing-forest
+// ---------------------------------------------------------------------------
+
+/// Writer ghi log vào stdin pipe của tiến trình PowerShell con.
+///
+/// Nếu pipe không tồn tại (console chưa bật hoặc đã bị tắt), dữ liệu được
+/// bỏ qua một cách im lặng mà không gây panic hay block ứng dụng chính.
+pub struct ConsoleWriter;
+
+impl<'a> MakeWriter<'a> for ConsoleWriter {
+    type Writer = PipeWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        PipeWriter
+    }
+}
+
+/// Writer thực thi ghi dữ liệu vào stdin pipe.
+///
+/// **Quy tắc quan trọng**: Hàm `write()` **KHÔNG BAO GIỜ** trả về `Err`.
+///
+/// Lý do: `tracing-forest` sử dụng `.expect()` trên kết quả của `Processor::process()`.
+/// Nếu `write()` trả về lỗi (ví dụ: `BrokenPipe` khi console bị tắt), nó sẽ
+/// lan truyền lên `Printer::process()` -> `ForestLayer::on_event()` -> `.expect()` -> **panic**.
+///
+/// Khi phát hiện pipe bị broken, writer tự động dọn dẹp pipe (set `None`) và
+/// cập nhật `CONSOLE_VISIBLE = false`, sau đó trả về `Ok(buf.len())` để nuốt dữ liệu.
+pub struct PipeWriter;
+
+impl std::io::Write for PipeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Ok(mut guard) = CONSOLE_PIPE.lock() {
+            if let Some(ref mut pipe) = *guard {
+                match pipe.write(buf) {
+                    Ok(n) => return Ok(n),
+                    Err(_) => {
+                        // Pipe broken (console bị tắt) -> dọn dẹp
+                        *guard = None;
+                        CONSOLE_VISIBLE.store(false, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+        // Pipe không tồn tại hoặc bị broken -> nuốt dữ liệu
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Ok(mut guard) = CONSOLE_PIPE.lock() {
+            if let Some(ref mut pipe) = *guard {
+                if pipe.flush().is_err() {
+                    *guard = None;
+                    CONSOLE_VISIBLE.store(false, Ordering::SeqCst);
+                }
+            }
+        }
+        Ok(())
     }
 }

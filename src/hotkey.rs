@@ -1,24 +1,46 @@
+//! Quản lý phím nóng toàn cục (Global Hotkeys) bằng API Win32.
+//!
+//! Module chịu trách nhiệm đăng ký, hủy đăng ký và ánh xạ các phím nóng toàn cục.
+//!
+//! Mặc định, ứng dụng đăng ký hai phím nóng:
+//! - **Alt + [**: Di chuyển tiêu điểm sang nút Taskbar bên trái ([`HotkeyAction::Left`])
+//! - **Alt + ]**: Di chuyển tiêu điểm sang nút Taskbar bên phải ([`HotkeyAction::Right`])
+
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, VK_OEM_4, VK_OEM_6,
 };
 
+/// Các hành động có thể kích hoạt bởi phím nóng toàn cục
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HotkeyAction {
+    /// Di chuyển tiêu điểm sang cửa sổ bên trái trên Taskbar.
     Left,
+    /// Di chuyển tiêu điểm sang cửa sổ bên phải trên Taskbar.
     Right,
 }
 
+/// Lưu trữ thông tin chi tiết và trạng thái của một phím nóng cụ thể.
 struct Hotkey {
+    /// Mã định danh duy nhất (ID) của phím nóng trong phạm vi ứng dụng.
     id: i32,
+    /// Hành động sẽ được thực thi khi phím nóng này được nhấn.
     action: HotkeyAction,
+    /// Các phím bổ trợ đi kèm (như phím Alt, Ctrl, Shift).
     modifiers: HOT_KEY_MODIFIERS,
+    /// Mã phím ảo (Virtual Key Code) của phím chính.
     vk: u32,
 }
 
 impl Hotkey {
+    /// Đăng ký phím nóng này với hệ thống Windows.
+    ///
+    /// # Lỗi (Errors)
+    /// Trả về lỗi nếu phím nóng đã bị chiếm dụng bởi ứng dụng khác.
     fn register(&self) -> windows::core::Result<()> {
         unsafe { RegisterHotKey(None, self.id, self.modifiers, self.vk) }
     }
+
+    /// Hủy đăng ký phím nóng này khỏi hệ thống Windows.
     fn unregister(&self) {
         unsafe {
             let _ = UnregisterHotKey(None, self.id);
@@ -26,11 +48,24 @@ impl Hotkey {
     }
 }
 
+/// Trình quản lý danh sách các phím nóng toàn cục của ứng dụng.
 pub struct HotkeyManager {
+    /// Danh sách các thực thể phím nóng đang được quản lý.
     hotkeys: Vec<Hotkey>,
 }
 
 impl HotkeyManager {
+    /// Khởi tạo trình quản lý và đăng ký các phím nóng mặc định với hệ thống.
+    ///
+    /// Mặc định:
+    /// - ID 1: `Alt+[` -> Di chuyển trái ([`HotkeyAction::Left`]).
+    /// - ID 2: `Alt+]` -> Di chuyển phải ([`HotkeyAction::Right`]).
+    ///
+    /// TODO: Cho phép người dùng tự điều chỉnh được phím tắt
+    ///
+    /// # Errors
+    /// Trả về lỗi nếu không thể đăng ký một hoặc nhiều phím nóng (thường do xung đột phím nóng với
+    /// phần mềm khác).
     pub fn new() -> anyhow::Result<Self> {
         let this = Self {
             hotkeys: vec![
@@ -63,13 +98,26 @@ impl HotkeyManager {
         Ok(this)
     }
 
+    /// Hủy đăng ký toàn bộ các phím nóng đã được thiết lập với Windows.
+    ///
+    /// Phương thức này được gọi tự động khi đối tượng `HotkeyManager` bị hủy ([`Drop`])
     pub fn unregister_all(&self) {
         for hotkey in &self.hotkeys {
             hotkey.unregister();
         }
     }
 
+    /// Tìm kiếm hành động tương ứng với ID phím nóng nhận được từ tin nhắn hệ thống
+    /// [`windows::Win32::UI::WindowsAndMessaging::WM_HOTKEY`]
+    ///
+    /// Trả về `Some(HotkeyAction)` nếu khớp ID, ngược lại trả về `None`.
     pub fn action_from_id(&self, id: i32) -> Option<HotkeyAction> {
         self.hotkeys.iter().find(|h| h.id == id).map(|h| h.action)
+    }
+}
+
+impl Drop for HotkeyManager {
+    fn drop(&mut self) {
+        self.unregister_all();
     }
 }

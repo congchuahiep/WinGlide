@@ -29,7 +29,7 @@ impl WinEventHook {
     ///
     /// # Safety
     /// Phải gọi trên main thread (STA).
-    pub unsafe fn install(uncombine: &'static UncombineManager) -> anyhow::Result<Self> {
+    pub unsafe fn install(uncombine: &UncombineManager) -> anyhow::Result<Self> {
         MAIN_THREAD_ID.store(GetCurrentThreadId(), Ordering::SeqCst);
         UNCOMBINE.store(uncombine as *const _ as *mut _, Ordering::SeqCst);
 
@@ -50,15 +50,21 @@ impl WinEventHook {
         debug!("WinEvent hook installed (EVENT_OBJECT_SHOW)");
         Ok(Self { hook_handle: hook })
     }
+
+    /// Uninstalls the WinEvent hook. This should be called when the hook is no longer needed.
+    /// Automatically called when the hook is dropped.
+    pub unsafe fn uninstall(&mut self) {
+        let _ = UnhookWinEvent(self.hook_handle);
+        UNCOMBINE.store(std::ptr::null_mut(), Ordering::SeqCst);
+        debug!("WinEvent hook uninstalled");
+    }
 }
 
 impl Drop for WinEventHook {
     fn drop(&mut self) {
         unsafe {
-            let _ = UnhookWinEvent(self.hook_handle);
+            self.uninstall();
         }
-        UNCOMBINE.store(std::ptr::null_mut(), Ordering::SeqCst);
-        debug!("WinEvent hook uninstalled");
     }
 }
 

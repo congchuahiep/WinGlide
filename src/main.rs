@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 mod app;
 mod event;
 mod hotkey;
@@ -15,6 +17,7 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 struct Args {
     verbose: bool,
     combine_enabled: bool,
+    console_worker: bool,
 }
 
 fn parse_args() -> Args {
@@ -22,6 +25,7 @@ fn parse_args() -> Args {
     Args {
         verbose: raw.iter().any(|a| a == "-v" || a == "--verbose"),
         combine_enabled: raw.iter().any(|a| a == "--combine-mode"),
+        console_worker: raw.iter().any(|a| a == "--console-worker"),
     }
 }
 
@@ -49,9 +53,15 @@ fn print_help(args: &Args) {
 
 fn main() -> anyhow::Result<()> {
     let args = parse_args();
+
     print_help(&args);
 
+    if args.console_worker {
+        logging::console::run_worker();
+        return Ok(());
+    }
     let _guard = logging::setup_logger(args.verbose);
+
     let main_thread_id = unsafe { GetCurrentThreadId() };
     let mut app = app::App::new(args.combine_enabled)?;
 

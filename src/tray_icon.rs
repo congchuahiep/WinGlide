@@ -15,8 +15,10 @@ const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.ico");
 
 pub const IDM_EXIT: u32 = 1;
 pub const IDM_COMBINE_MODE: u32 = 2;
+pub const IDM_SHOW_CONSOLE: u32 = 3;
 
 const TEXT_COMBINE_MODE: PCWSTR = w!("Combine Mode");
+const TEXT_SHOW_CONSOLE: PCWSTR = w!("Debug Console");
 const TEXT_EXIT: PCWSTR = w!("Exit");
 
 /// Quản lý vòng đời và hành vi của biểu tượng trên khay hệ thống Windows.
@@ -63,14 +65,15 @@ impl TrayIcon {
     /// Hàm này **bắt buộc phải được gọi từ luồng WndProc** (cùng luồng STA quản lý cửa sổ ẩn nhận
     /// tin nhắn). Nguyên nhân là do API `TrackPopupMenu` cần xử lý các tin nhắn `WM_COMMAND` một
     /// cách đồng bộ.
-    pub fn show(&self, combine_enabled: bool) -> anyhow::Result<()> {
+    pub fn show(&self, combine_enabled: bool, console_visible: bool) -> anyhow::Result<()> {
         let hwnd = self.data.hWnd;
         let mut cursor = POINT::default();
         unsafe {
-            // Đưa cửa sổ ẩn lên foreground để khi click ra ngoài menu, menu sẽ tự động đóng lại (bắt buộc theo tài liệu Win32).
+            // Đưa cửa sổ ẩn lên foreground để khi click ra ngoài menu, menu sẽ tự động đóng lại
+            // (bắt buộc theo tài liệu Win32).
             let _ = SetForegroundWindow(hwnd);
             GetCursorPos(&mut cursor)?;
-            let hmenu = Self::create_menu(combine_enabled)?;
+            let hmenu = Self::create_menu(combine_enabled, console_visible)?;
             let _ = TrackPopupMenu(
                 hmenu,
                 TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON,
@@ -135,7 +138,7 @@ impl TrayIcon {
     /// - Tùy chọn "Combine Mode" (sử dụng checkbox tích chọn tùy vào giá trị của `combine_enabled`)
     /// - Đường phân cách (Separator)
     /// - Tùy chọn "Exit" để đóng ứng dụng
-    fn create_menu(combine_enabled: bool) -> anyhow::Result<HMENU> {
+    fn create_menu(combine_enabled: bool, console_visible: bool) -> anyhow::Result<HMENU> {
         unsafe {
             let hmenu = CreatePopupMenu()?;
             let combine_flags = MF_STRING
@@ -144,13 +147,26 @@ impl TrayIcon {
                 } else {
                     MF_UNCHECKED
                 };
-
             AppendMenuW(
                 hmenu,
                 combine_flags,
                 IDM_COMBINE_MODE as usize,
                 TEXT_COMBINE_MODE,
             )?;
+
+            let console_flags = MF_STRING
+                | if console_visible {
+                    MF_CHECKED
+                } else {
+                    MF_UNCHECKED
+                };
+            AppendMenuW(
+                hmenu,
+                console_flags,
+                IDM_SHOW_CONSOLE as usize,
+                TEXT_SHOW_CONSOLE,
+            )?;
+
             AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null())?;
             AppendMenuW(hmenu, MF_STRING, IDM_EXIT as usize, TEXT_EXIT)?;
 
