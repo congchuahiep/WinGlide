@@ -1,8 +1,9 @@
-#![windows_subsystem = "windows"]
+// #![windows_subsystem = "windows"]
 
 mod app;
 mod event;
 mod hotkey;
+mod indicator;
 mod logging;
 mod taskbar;
 mod tray_icon;
@@ -51,6 +52,14 @@ fn print_help(args: &Args) {
 }
 
 fn main() -> anyhow::Result<()> {
+    unsafe {
+        // Thông báo cho Windows: "Tôi tự lo được màn hình độ phân giải cao (Per-Monitor v2),
+        // đừng tự zoom mờ app của tôi!"
+        let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+            windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        );
+    }
+
     let args = parse_args();
 
     print_help(&args);
