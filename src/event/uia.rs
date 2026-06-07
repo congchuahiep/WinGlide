@@ -108,16 +108,22 @@ impl UiaEventHook {
             handler,
         })
     }
+
+    /// Uninstalls the UIA StructureChanged event handler.
+    /// Automatically called when the hook is dropped.
+    pub unsafe fn uninstall(&mut self) {
+        let _ = self
+            .automation
+            .RemoveStructureChangedEventHandler(&self.taskbar_element, self.handler);
+        debug!("UIA StructureChanged event handler uninstalled");
+    }
 }
 
 impl Drop for UiaEventHook {
     fn drop(&mut self) {
         unsafe {
-            let _ = self
-                .automation
-                .RemoveStructureChangedEventHandler(&self.taskbar_element, self.handler);
+            self.uninstall();
         }
-        debug!("UIA StructureChanged event handler uninstalled");
     }
 }
 

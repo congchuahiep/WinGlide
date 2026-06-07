@@ -147,6 +147,12 @@ impl UncombineManager {
     }
 }
 
+impl Drop for UncombineManager {
+    fn drop(&mut self) {
+        self.restore_all();
+    }
+}
+
 // ── Helper functions (private) ──
 
 /// Set AppUserModelID cho một cửa sổ.
