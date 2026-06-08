@@ -193,6 +193,10 @@ pub struct PipeWriter;
 
 impl std::io::Write for PipeWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if crate::logging::console::DEBUG_CLI_MODE.load(Ordering::SeqCst) {
+            return std::io::stdout().write(buf);
+        }
+
         if let Ok(mut guard) = CONSOLE_PIPE.lock() {
             if let Some(ref mut pipe) = *guard {
                 match pipe.write(buf) {
@@ -210,6 +214,10 @@ impl std::io::Write for PipeWriter {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        if crate::logging::console::DEBUG_CLI_MODE.load(Ordering::SeqCst) {
+            return std::io::stdout().flush();
+        }
+
         if let Ok(mut guard) = CONSOLE_PIPE.lock() {
             if let Some(ref mut pipe) = *guard {
                 if pipe.flush().is_err() {

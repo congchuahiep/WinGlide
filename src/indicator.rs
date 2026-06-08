@@ -1,20 +1,22 @@
 //! Cửa sổ hiển thị trạng thái (Indicator) trên Taskbar.
 
 use std::slice::from_raw_parts_mut;
+use std::sync::atomic::{AtomicIsize, Ordering};
 
 use windows::core::w;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::Win32::UI::Input::KeyboardAndMouse;
+use windows::Win32::UI::WindowsAndMessaging::{self, *};
 
 use crate::utils;
 
 const WM_APP_VD_EVENT: u32 = WM_USER + 0x100;
 
-static HOVER_INDEX: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(-1);
+static HOVER_INDEX: AtomicIsize = AtomicIsize::new(-1);
 
-fn get_hovered_index(x: i32, y: i32) -> Option<usize> {
+fn get_hovered_index(x: i32) -> Option<usize> {
     unsafe {
         let mut tray_rect = RECT::default();
         if let Ok(taskbar_hwnd) = FindWindowW(w!("Shell_TrayWnd"), None) {
@@ -28,10 +30,8 @@ fn get_hovered_index(x: i32, y: i32) -> Option<usize> {
         let radius = height as f32 * 0.08;
         let spacing = radius * 4.5;
         let start_x = 10.0 + radius;
-        let cy = height as f32 / 2.0;
 
         let px = x as f32;
-        let py = y as f32;
 
         let count = winvd::get_desktop_count().unwrap_or(1) as usize;
         let half_spacing = spacing / 2.0;
@@ -213,7 +213,7 @@ impl IndicatorWindow {
                     }
                 }
 
-                let hover_idx = HOVER_INDEX.load(std::sync::atomic::Ordering::Relaxed);
+                let hover_idx = HOVER_INDEX.load(Ordering::Relaxed);
 
                 for i in 0..count {
                     let cx = start_x + (i as f32) * spacing;
@@ -457,8 +457,7 @@ impl IndicatorWindow {
             }
             WM_MOUSEMOVE => {
                 let x = ((lparam.0 as i32) << 16) >> 16;
-                let y = (lparam.0 as i32) >> 16;
-                let hovered = get_hovered_index(x, y);
+                let hovered = get_hovered_index(x);
                 let old = HOVER_INDEX.load(std::sync::atomic::Ordering::Relaxed);
                 let new_val = hovered.map(|i| i as isize).unwrap_or(-1);
 
@@ -467,13 +466,13 @@ impl IndicatorWindow {
                     Self::render(hwnd);
 
                     if new_val != -1 {
-                        let mut tme = windows::Win32::UI::Input::KeyboardAndMouse::TRACKMOUSEEVENT {
-                            cbSize: std::mem::size_of::<windows::Win32::UI::Input::KeyboardAndMouse::TRACKMOUSEEVENT>() as u32,
-                            dwFlags: windows::Win32::UI::Input::KeyboardAndMouse::TME_LEAVE,
+                        let mut tme = KeyboardAndMouse::TRACKMOUSEEVENT {
+                            cbSize: std::mem::size_of::<KeyboardAndMouse::TRACKMOUSEEVENT>() as u32,
+                            dwFlags: KeyboardAndMouse::TME_LEAVE,
                             hwndTrack: hwnd,
                             dwHoverTime: 0,
                         };
-                        let _ = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::TrackMouseEvent(&mut tme) };
+                        let _ = unsafe { KeyboardAndMouse::TrackMouseEvent(&mut tme) };
                     }
                 }
                 LRESULT(0)
@@ -485,8 +484,7 @@ impl IndicatorWindow {
             }
             WM_LBUTTONUP => {
                 let x = ((lparam.0 as i32) << 16) >> 16;
-                let y = (lparam.0 as i32) >> 16;
-                if let Some(idx) = get_hovered_index(x, y) {
+                if let Some(idx) = get_hovered_index(x) {
                     if let Ok(desktops) = winvd::get_desktops() {
                         if idx < desktops.len() {
                             let _ = winvd::switch_desktop(desktops[idx]);
@@ -495,13 +493,13 @@ impl IndicatorWindow {
                 }
                 LRESULT(0)
             }
-            windows::Win32::UI::WindowsAndMessaging::WM_SETCURSOR => {
+            WindowsAndMessaging::WM_SETCURSOR => {
                 unsafe {
-                    let cursor = windows::Win32::UI::WindowsAndMessaging::LoadCursorW(
+                    let cursor = WindowsAndMessaging::LoadCursorW(
                         None,
-                        windows::Win32::UI::WindowsAndMessaging::IDC_HAND
+                        WindowsAndMessaging::IDC_HAND
                     ).unwrap();
-                    let _ = windows::Win32::UI::WindowsAndMessaging::SetCursor(Some(cursor));
+                    let _ = WindowsAndMessaging::SetCursor(Some(cursor));
                 }
                 LRESULT(1)
             }
