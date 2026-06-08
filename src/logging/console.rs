@@ -29,6 +29,9 @@ extern "system" {
 /// Cờ đồng bộ trạng thái hiển thị Console.
 pub static CONSOLE_VISIBLE: AtomicBool = AtomicBool::new(false);
 
+/// Cờ báo hiệu ứng dụng đang chạy ở chế độ CLI debug (in log ra stdout).
+pub static DEBUG_CLI_MODE: AtomicBool = AtomicBool::new(false);
+
 /// Handle tiến trình con Console, bảo vệ bằng Mutex.
 static CHILD_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
 
@@ -37,6 +40,10 @@ pub static CONSOLE_PIPE: Mutex<Option<std::process::ChildStdin>> = Mutex::new(No
 
 /// Bật/tắt cửa sổ Debug Console.
 pub fn toggle() {
+    if DEBUG_CLI_MODE.load(Ordering::SeqCst) {
+        return;
+    }
+
     let was_visible = CONSOLE_VISIBLE.load(Ordering::SeqCst);
     let new_visible = !was_visible;
     CONSOLE_VISIBLE.store(new_visible, Ordering::SeqCst);

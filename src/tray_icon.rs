@@ -155,7 +155,9 @@ impl TrayIcon {
             )?;
 
             let console_flags = MF_STRING
-                | if console_visible {
+                | if crate::logging::console::DEBUG_CLI_MODE.load(std::sync::atomic::Ordering::SeqCst) {
+                    MF_GRAYED | MF_DISABLED
+                } else if console_visible {
                     MF_CHECKED
                 } else {
                     MF_UNCHECKED
