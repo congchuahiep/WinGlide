@@ -3,8 +3,8 @@
   <component name="ProjectModuleManager">
     <modules>
       <module
-                fileurl="file://$PROJECT_DIR$/.idea/better-windows-navigate.iml"
-                filepath="$PROJECT_DIR$/.idea/better-windows-navigate.iml"
+                fileurl="file://$PROJECT_DIR$/.idea/win-glide.iml"
+                filepath="$PROJECT_DIR$/.idea/win-glide.iml"
             />
     </modules>
   </component>

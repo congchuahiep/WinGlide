@@ -94,15 +94,14 @@ fn main() -> anyhow::Result<()> {
             FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
         };
 
-        let mutex_name = windows::core::w!("Global\\BetterWindowsNavigate_SettingsUIMutex");
+        let mutex_name = windows::core::w!("Global\\WinGlide_SettingsUIMutex");
         let _ui_mutex = unsafe { CreateMutexW(None, false, mutex_name).unwrap_or_default() };
         if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
             // Tìm cửa sổ Settings UI cũ và đưa lên foreground
             unsafe {
-                if let Ok(hwnd) = FindWindowW(
-                    windows::core::PCWSTR::null(),
-                    windows::core::w!("Better Windows Navigate"),
-                ) {
+                if let Ok(hwnd) =
+                    FindWindowW(windows::core::PCWSTR::null(), windows::core::w!("WinGlide"))
+                {
                     if !hwnd.is_invalid() {
                         let _ = ShowWindow(hwnd, SW_RESTORE);
                         let _ = SetForegroundWindow(hwnd);
@@ -135,13 +134,13 @@ fn main() -> anyhow::Result<()> {
     use windows::Win32::System::Threading::CreateMutexW;
     use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_COMMAND};
 
-    let mutex_name = windows::core::w!("Global\\BetterWindowsNavigate_BackgroundMutex");
+    let mutex_name = windows::core::w!("Global\\WinGlide_BackgroundMutex");
     let _bg_mutex = unsafe { CreateMutexW(None, false, mutex_name).unwrap_or_default() };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         unsafe {
             // Gửi lệnh hiện Settings UI cho background app đang chạy
             if let Ok(hwnd) = FindWindowW(
-                windows::core::w!("BetterWindowsNavigateTray"),
+                windows::core::w!("WinGlideTray"),
                 windows::core::PCWSTR::null(),
             ) {
                 if !hwnd.is_invalid() {

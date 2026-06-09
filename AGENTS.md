@@ -7,12 +7,12 @@ Rust (edition 2021) app for **Windows 11 only** - cycles through taskbar buttons
 ## Developer commands
 
 ```bash
-cargo build --release              # binary -> target/release/better-windows-navigate.exe
+cargo build --release              # binary -> target/release/win-glide.exe
 cargo build                        # debug build
 cargo check                        # quick type-check (no codegen needed)
-./target/release/better-windows-navigate.exe            # normal run
-./target/release/better-windows-navigate.exe -v         # with debug logging
-./target/release/better-windows-navigate.exe --combine-mode  # keep taskbar buttons grouped
+./target/release/win-glide.exe            # normal run
+./target/release/win-glide.exe -v         # with debug logging
+./target/release/win-glide.exe --combine-mode  # keep taskbar buttons grouped
 ```
 
 No lint/formatter config exists in the repo - only `cargo check` / `cargo build` are available.
@@ -73,7 +73,7 @@ Button-to-window matching tries 4 strategies in order:
 
 ### Logging output
 
-- Logs go to **file only** (`./logs/"better-windows-navigate.log` via `tracing-appender`). The console layer is commented out. Use `tracing_forest` for tree-structured output.
+- Logs go to **file only** (`./logs/"win-glide.log` via `tracing-appender`). The console layer is commented out. Use `tracing_forest` for tree-structured output.
 
 ### Dependencies
 

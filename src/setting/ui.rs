@@ -14,7 +14,7 @@ use crate::setting::setting_item::{setting_item, SettingItemProps};
 fn send_reload_signal() {
     unsafe {
         if let Ok(hwnd) = windows::Win32::UI::WindowsAndMessaging::FindWindowW(
-            windows::core::w!("BetterWindowsNavigateTray"),
+            windows::core::w!("WinGlideTray"),
             windows::core::PCWSTR::null(),
         ) {
             if !hwnd.is_invalid() {
@@ -32,7 +32,7 @@ fn send_reload_signal() {
 fn send_restart_admin_signal() {
     unsafe {
         if let Ok(hwnd) = windows::Win32::UI::WindowsAndMessaging::FindWindowW(
-            windows::core::w!("BetterWindowsNavigateTray"),
+            windows::core::w!("WinGlideTray"),
             windows::core::PCWSTR::null(),
         ) {
             if !hwnd.is_invalid() {
@@ -400,7 +400,7 @@ fn footer() -> Element {
             ShellExecuteW(
                 None,
                 w!("open"),
-                w!("https://github.com/congchuahiep/better-windows-navigate"),
+                w!("https://github.com/congchuahiep/win-glide"),
                 None,
                 None,
                 SW_SHOWNORMAL,
@@ -416,7 +416,7 @@ pub fn run() -> Result<()> {
     let _bootstrap_handle = bootstrap::initialize()?;
 
     App::new()
-        .title("Better Windows Navigate")
+        .title("WinGlide")
         .backdrop(Backdrop::Mica)
         .inner_size(500., 720.)
         .inner_constraints(InnerConstraints {

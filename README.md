@@ -1,4 +1,4 @@
-# Better Windows Navigate
+# WinGlide
 
 A powerful, lightweight utility built in Rust designed to enhance navigation and multitasking on Windows 11. It provides seamless keyboard-driven taskbar navigation, uncombines taskbar buttons, and offers quick virtual desktop switching.
 

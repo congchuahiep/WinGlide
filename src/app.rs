@@ -231,9 +231,7 @@ impl App {
                 let mouse_event = lparam.0 as u32;
                 // Hiển thị menu ngữ cảnh tại vị trí con trỏ chuột
                 if mouse_event == WM_LBUTTONUP || mouse_event == WM_RBUTTONUP {
-                    if let Err(e) = self.tray_icon.show(
-                        CONSOLE_VISIBLE.load(Ordering::SeqCst),
-                    ) {
+                    if let Err(e) = self.tray_icon.show(CONSOLE_VISIBLE.load(Ordering::SeqCst)) {
                         error!("show_context_menu: {e}");
                     }
                 }
@@ -318,7 +316,7 @@ impl App {
 
         let wnd_class = WNDCLASSW {
             hInstance: HINSTANCE(hinstance.0),
-            lpszClassName: w!("BetterWindowsNavigateTray"),
+            lpszClassName: w!("WinGlideTray"),
             lpfnWndProc: Some(Self::window_proc),
             ..Default::default()
         };
@@ -331,7 +329,7 @@ impl App {
         let hwnd = unsafe {
             CreateWindowExW(
                 WS_EX_LAYERED | WS_EX_TOOLWINDOW,
-                w!("BetterWindowsNavigateTray"),
+                w!("WinGlideTray"),
                 w!(""),
                 WINDOW_STYLE(0),
                 0,

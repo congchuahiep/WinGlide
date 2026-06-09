@@ -44,10 +44,10 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// Lấy đường dẫn lưu file cấu hình (trong AppData/Roaming/"better-windows-navigate)
+    /// Lấy đường dẫn lưu file cấu hình (trong AppData/Roaming/"win-glide)
     pub fn config_path() -> PathBuf {
         let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-        path.push("better-windows-navigate");
+        path.push("win-glide");
         fs::create_dir_all(&path).ok();
         path.push("config.json");
         path

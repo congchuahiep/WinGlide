@@ -7,7 +7,7 @@ use windows::Win32::System::Registry::{
     RRF_RT_REG_SZ,
 };
 
-const APP_NAME: PCWSTR = w!("Better Windows Navigate");
+const APP_NAME: PCWSTR = w!("WinGlide");
 const REG_RUN_PATH: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 
 pub fn is_autostart_enabled() -> bool {
