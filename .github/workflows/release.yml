@@ -35,11 +35,10 @@ jobs:
       - name: Harvest dependencies with heat
         run: |
           # Dùng wix v3 heat.exe có sẵn trên GitHub Actions windows-latest
-          & "${env:WIX}bin\heat.exe" dir dist -cg AppDependencies -dr APPLICATIONFOLDER -scom -sreg -sfrag -srd -gg -out wix\dependencies.wxs
-          (Get-Content wix\dependencies.wxs) -replace 'SourceDir\\', 'dist\' | Set-Content wix\dependencies.wxs
+          & "${env:WIX}bin\heat.exe" dir dist -cg AppDependencies -dr APPLICATIONFOLDER -scom -sreg -sfrag -srd -gg -var var.DistDir -out wix\dependencies.wxs
 
       - name: Build MSI Installer
-        run: cargo wix --nocapture -p win-glide -L -sval
+        run: cargo wix --nocapture -p win-glide -C -dDistDir=dist -L -sval
 
       - name: Rename Installer
         run: |
