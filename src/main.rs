@@ -12,6 +12,7 @@ mod setting;
 mod taskbar;
 mod tray_icon;
 mod types;
+mod updater;
 mod utils;
 
 use std::sync::atomic::Ordering;

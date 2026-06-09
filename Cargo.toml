@@ -1,5 +1,5 @@
 [package]
-name = "better-windows-navigate"
+name = "win-glide"
 version = "0.0.1"
 edition = "2021"
 exclude = ["docs/"]
