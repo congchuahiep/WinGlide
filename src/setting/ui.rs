@@ -29,6 +29,24 @@ fn send_reload_signal() {
     }
 }
 
+fn send_restart_admin_signal() {
+    unsafe {
+        if let Ok(hwnd) = windows::Win32::UI::WindowsAndMessaging::FindWindowW(
+            windows::core::w!("BetterWindowsNavigateTray"),
+            windows::core::PCWSTR::null(),
+        ) {
+            if !hwnd.is_invalid() {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(hwnd),
+                    crate::event::WM_APP_RESTART_AS_ADMIN,
+                    windows::Win32::Foundation::WPARAM(1),
+                    windows::Win32::Foundation::LPARAM(0),
+                );
+            }
+        }
+    }
+}
+
 /// Khung chính của ứng dụng cài đặt (Settings App).
 /// Gồm một luồng (`vstack`) chứa toàn bộ các khối nội dung, padding đều ra xung quanh.
 pub fn settings_app(cx: &mut RenderCx) -> Element {
@@ -344,6 +362,30 @@ fn system_settings(cx: &mut RenderCx) -> Element {
             },
             cx,
         ),
+        setting_item(
+            &SettingItemProps {
+                icon: Some('\u{E7EF}'),
+                title: Some("Administrator Privileges".into()),
+                description: Some(if crate::admin::is_running_as_admin() {
+                    "Running as Administrator. All features are available.".into()
+                } else {
+                    "Restart as Administrator to interact with elevated windows.".into()
+                }),
+                action: Some(if crate::admin::is_running_as_admin() {
+                    button("Elevated").enabled(false).into()
+                } else {
+                    button("Restart")
+                        .on_click(|| {
+                            send_restart_admin_signal();
+                        })
+                        .into()
+                }),
+                children: None,
+                always_expand: false,
+                enabled: true,
+            },
+            cx,
+        ),
     ))
     .spacing(4.0)
     .into()
@@ -403,8 +445,40 @@ pub fn run() -> Result<()> {
 pub fn show_ui() {
     let exe_path = std::env::current_exe().expect("Failed to get executable path");
 
-    std::process::Command::new(exe_path)
+    let child = std::process::Command::new(exe_path)
         .arg("--settings-ui")
         .spawn()
         .expect("Failed to spawn settings UI process");
+
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    static UI_JOB: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+
+    let job_handle = UI_JOB.get_or_init(|| unsafe {
+        let job = CreateJobObjectW(None, windows::core::PCWSTR::null()).unwrap_or(HANDLE::default());
+        if !job.is_invalid() {
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let _ = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+        }
+        job.0 as isize
+    });
+
+    unsafe {
+        let job = HANDLE(*job_handle as *mut _);
+        if !job.is_invalid() {
+            let _ = AssignProcessToJobObject(job, HANDLE(child.as_raw_handle() as _));
+        }
+    }
 }
