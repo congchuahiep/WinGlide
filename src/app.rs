@@ -326,7 +326,7 @@ impl App {
 
         let wnd_class = WNDCLASSW {
             hInstance: HINSTANCE(hinstance.0),
-            lpszClassName: w!("TaskbarSwitcherTray"),
+            lpszClassName: w!("BetterWindowsNavigateTray"),
             lpfnWndProc: Some(Self::window_proc),
             ..Default::default()
         };
@@ -339,7 +339,7 @@ impl App {
         let hwnd = unsafe {
             CreateWindowExW(
                 WS_EX_LAYERED | WS_EX_TOOLWINDOW,
-                w!("TaskbarSwitcherTray"),
+                w!("BetterWindowsNavigateTray"),
                 w!(""),
                 WINDOW_STYLE(0),
                 0,
