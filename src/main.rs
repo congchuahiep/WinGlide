@@ -88,6 +88,30 @@ fn main() -> anyhow::Result<()> {
     }
 
     if args.settings_ui {
+        use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+        use windows::Win32::System::Threading::CreateMutexW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
+        };
+
+        let mutex_name = windows::core::w!("Global\\BetterWindowsNavigate_SettingsUIMutex");
+        let _ui_mutex = unsafe { CreateMutexW(None, false, mutex_name).unwrap_or_default() };
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            // Tìm cửa sổ Settings UI cũ và đưa lên foreground
+            unsafe {
+                if let Ok(hwnd) = FindWindowW(
+                    windows::core::PCWSTR::null(),
+                    windows::core::w!("Better Windows Navigate"),
+                ) {
+                    if !hwnd.is_invalid() {
+                        let _ = ShowWindow(hwnd, SW_RESTORE);
+                        let _ = SetForegroundWindow(hwnd);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         let _guard = logging::setup_logger(args.verbose);
         tracing::info!("Starting settings UI process");
 
@@ -105,6 +129,33 @@ fn main() -> anyhow::Result<()> {
     print_help(&args);
 
     let _guard = logging::setup_logger(args.verbose);
+
+    // Single Instance cho background app
+    use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, LPARAM, WPARAM};
+    use windows::Win32::System::Threading::CreateMutexW;
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_COMMAND};
+
+    let mutex_name = windows::core::w!("Global\\BetterWindowsNavigate_BackgroundMutex");
+    let _bg_mutex = unsafe { CreateMutexW(None, false, mutex_name).unwrap_or_default() };
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe {
+            // Gửi lệnh hiện Settings UI cho background app đang chạy
+            if let Ok(hwnd) = FindWindowW(
+                windows::core::w!("BetterWindowsNavigateTray"),
+                windows::core::PCWSTR::null(),
+            ) {
+                if !hwnd.is_invalid() {
+                    let _ = PostMessageW(
+                        Some(hwnd),
+                        WM_COMMAND,
+                        WPARAM(crate::tray_icon::IDM_SETTINGS as usize),
+                        LPARAM(0),
+                    );
+                }
+            }
+        }
+        return Ok(());
+    }
 
     // Cấu hình DPI Aware cho tiến trình background
     unsafe {
