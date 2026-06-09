@@ -1,6 +1,9 @@
 //! Root UI module cho Settings application.
 //! Nơi khởi tạo cấu trúc layout chính bao gồm Header, các mục Settings, Logging và Footer.
 
+use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows_core::w;
 use windows_reactor::*;
 
 use crate::config::AppConfig;
@@ -11,7 +14,7 @@ use crate::setting::setting_item::{setting_item, SettingItemProps};
 fn send_reload_signal() {
     unsafe {
         if let Ok(hwnd) = windows::Win32::UI::WindowsAndMessaging::FindWindowW(
-            windows::core::w!("TaskbarSwitcherTray"),
+            windows::core::w!("BetterWindowsNavigateTray"),
             windows::core::PCWSTR::null(),
         ) {
             if !hwnd.is_invalid() {
@@ -33,6 +36,7 @@ pub fn settings_app(cx: &mut RenderCx) -> Element {
         header(),
         taskbar_settings(cx),
         virtual_desktop_settings(cx),
+        system_settings(cx),
         logging(),
         footer(),
     ))
@@ -306,6 +310,45 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
     .into()
 }
 
+fn system_settings(cx: &mut RenderCx) -> Element {
+    let (autostart, set_autostart) = cx.use_state(crate::autostart::is_autostart_enabled());
+
+    vstack((
+        body_strong("System").margin(Thickness {
+            bottom: 10.,
+            ..Default::default()
+        }),
+        setting_item(
+            &SettingItemProps {
+                icon: Some('\u{E7E8}'),
+                title: Some("Start with Windows".into()),
+                description: Some("Automatically run Taskbar Switcher when you log in".into()),
+                action: Some(
+                    ToggleSwitch::new(autostart)
+                        .on_content("")
+                        .off_content("")
+                        .min_width(0.0)
+                        .width(42.)
+                        .on_changed({
+                            move |checked| {
+                                if crate::autostart::set_autostart(checked).is_ok() {
+                                    set_autostart.call(checked);
+                                }
+                            }
+                        })
+                        .into(),
+                ),
+                children: None,
+                always_expand: false,
+                enabled: true,
+            },
+            cx,
+        ),
+    ))
+    .spacing(4.0)
+    .into()
+}
+
 /// Khối hiển thị thông tin Debug Logging.
 fn logging() -> Element {
     vstack((
@@ -324,8 +367,15 @@ fn footer() -> Element {
         body_strong("About"),
         body("Version: 0.0.1"),
         body("Author: @congchuahiep"),
-        button("GitHub Repository").on_click(|| {
-            // Open browser
+        button("GitHub Repository").on_click(|| unsafe {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                w!("https://github.com/congchuahiep/better-windows-navigate"),
+                None,
+                None,
+                SW_SHOWNORMAL,
+            );
         }),
     ))
     .spacing(8.0)
@@ -337,7 +387,7 @@ pub fn run() -> Result<()> {
     let _bootstrap_handle = bootstrap::initialize()?;
 
     App::new()
-        .title("Better windows navigate")
+        .title("Better Windows Navigate")
         .backdrop(Backdrop::Mica)
         .inner_size(500., 720.)
         .inner_constraints(InnerConstraints {
