@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod admin;
 mod app;
 mod autostart;
 mod config;
@@ -27,6 +28,7 @@ struct Args {
     combine_enabled: bool,
     console_worker: bool,
     settings_ui: bool,
+    reopen_ui: bool,
 }
 
 fn parse_args() -> Args {
@@ -37,6 +39,7 @@ fn parse_args() -> Args {
         combine_enabled: raw.iter().any(|a| a == "--combine-mode"),
         console_worker: raw.iter().any(|a| a == "--console-worker"),
         settings_ui: raw.iter().any(|a| a == "--settings-ui"),
+        reopen_ui: raw.iter().any(|a| a == "--reopen-ui"),
     }
 }
 
@@ -112,6 +115,10 @@ fn main() -> anyhow::Result<()> {
     let main_thread_id = unsafe { GetCurrentThreadId() };
     let config = crate::config::AppConfig::load();
     let mut app = app::App::new(&config)?;
+
+    if args.reopen_ui {
+        setting::show_ui();
+    }
 
     unsafe {
         app.run(main_thread_id)?;

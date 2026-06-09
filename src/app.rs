@@ -244,6 +244,12 @@ impl App {
                 self.handle_reload_config();
                 Some(LRESULT(0))
             }
+            event::WM_APP_RESTART_AS_ADMIN => {
+                let reopen_ui = wparam.0 == 1;
+                let _ = crate::admin::restart_as_admin(reopen_ui);
+                unsafe { windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0) };
+                Some(LRESULT(0))
+            }
             // Các lệnh Command được gửi từ Menu ngữ cảnh của Khay hệ thống
             WM_COMMAND => {
                 let id = loword(wparam.0 as u32);
