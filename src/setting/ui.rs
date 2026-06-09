@@ -322,7 +322,7 @@ fn system_settings(cx: &mut RenderCx) -> Element {
             &SettingItemProps {
                 icon: Some('\u{E7E8}'),
                 title: Some("Start with Windows".into()),
-                description: Some("Automatically run Taskbar Switcher when you log in".into()),
+                description: Some("Automatically run this app when you log in".into()),
                 action: Some(
                     ToggleSwitch::new(autostart)
                         .on_content("")
