@@ -32,28 +32,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "better-windows-navigate"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "aquamarine",
- "dirs",
- "nu-ansi-term",
- "once_cell",
- "serde",
- "serde_json",
- "tracing",
- "tracing-appender",
- "tracing-forest",
- "tracing-subscriber",
- "windows 0.61.3",
- "windows-core 0.61.2",
- "windows-reactor",
- "windows-reactor-setup",
- "winvd",
-]
-
-[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -553,6 +531,28 @@ name = "wasi"
 version = "0.11.1+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
+
+[[package]]
+name = "win-glide"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "aquamarine",
+ "dirs",
+ "nu-ansi-term",
+ "once_cell",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-appender",
+ "tracing-forest",
+ "tracing-subscriber",
+ "windows 0.61.3",
+ "windows-core 0.61.2",
+ "windows-reactor",
+ "windows-reactor-setup",
+ "winvd",
+]
 
 [[package]]
 name = "winapi"

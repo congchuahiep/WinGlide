@@ -55,6 +55,7 @@ pub fn settings_app(cx: &mut RenderCx) -> Element {
         taskbar_settings(cx),
         virtual_desktop_settings(cx),
         system_settings(cx),
+        update_settings(cx),
         footer(),
     ))
     .spacing(32.0)
@@ -390,6 +391,85 @@ fn system_settings(cx: &mut RenderCx) -> Element {
     .into()
 }
 
+fn update_settings(cx: &mut RenderCx) -> Element {
+    let (update_info, set_update_info) =
+        cx.use_async_state::<Option<crate::updater::UpdateInfo>>(None);
+    let (checking, set_checking) = cx.use_async_state(false);
+
+    vstack((
+        body_strong("Updates").margin(Thickness {
+            bottom: 10.,
+            ..Default::default()
+        }),
+        setting_item(
+            &SettingItemProps {
+                icon: Some('\u{E895}'),
+                title: Some("Check for updates".into()),
+                description: Some(if checking {
+                    "Checking...".into()
+                } else if let Some(info) = update_info.as_ref() {
+                    format!("New version {} is available!", info.latest_version)
+                } else {
+                    format!("Current version: {}", env!("CARGO_PKG_VERSION"))
+                }),
+                action: Some(
+                    if let Some(info) = update_info.as_ref() {
+                        let url = info.download_url.clone();
+                        button("Update Now")
+                            .on_click(move || {
+                                if crate::updater::download_and_install(&url).is_ok() {
+                                    // Send signal to background app to exit
+                                    unsafe {
+                                        if let Ok(hwnd) = windows::Win32::UI::WindowsAndMessaging::FindWindowW(
+                                            windows::core::w!("WinGlideTray"),
+                                            windows::core::PCWSTR::null(),
+                                        ) {
+                                            if !hwnd.is_invalid() {
+                                                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                                                    Some(hwnd),
+                                                    windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+                                                    windows::Win32::Foundation::WPARAM(0),
+                                                    windows::Win32::Foundation::LPARAM(0),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    std::process::exit(0);
+                                }
+                            })
+                            .into()
+                    } else {
+                        button("Check")
+                            .enabled(!checking)
+                            .on_click({
+                                let set_checking = set_checking.clone();
+                                let set_update_info = set_update_info.clone();
+                                move || {
+                                    set_checking.call(true);
+                                    let set_checking_clone = set_checking.clone();
+                                    let set_update_info_clone = set_update_info.clone();
+                                    std::thread::spawn(move || {
+                                        if let Ok(Some(info)) = crate::updater::check_for_updates() {
+                                            set_update_info_clone.call(Some(info));
+                                        }
+                                        set_checking_clone.call(false);
+                                    });
+                                }
+                            })
+                            .into()
+                    }
+                ),
+                children: None,
+                always_expand: false,
+                enabled: true,
+            },
+            cx,
+        ),
+    ))
+    .spacing(4.0)
+    .into()
+}
+
 /// Khối Footer hiển thị thông tin tác giả và Repository.
 fn footer() -> Element {
     vstack((
@@ -413,7 +493,7 @@ fn footer() -> Element {
 
 /// Runs the settings UI application. Only run it in the main thread.
 pub fn run() -> Result<()> {
-    let _bootstrap_handle = bootstrap::initialize()?;
+    // let _bootstrap_handle = bootstrap::initialize()?;
 
     App::new()
         .title("WinGlide")

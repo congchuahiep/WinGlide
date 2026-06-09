@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix
+
+      - name: Build project
+        run: cargo build --release
+
+      - name: Gather dependencies
+        run: |
+          New-Item -ItemType Directory -Path dist -Force
+          Copy-Item target\release\*.dll dist\
+          Copy-Item target\release\*.pri dist\
+          Copy-Item target\release\Microsoft.UI.Xaml dist\ -Recurse
+          Get-ChildItem target\release | Where-Object { $_.PSIsContainer -and $_.Name -match "^[a-z]{2}(-[A-Za-z]+)*$" } | Copy-Item -Destination dist\ -Recurse
+
+      - name: Harvest dependencies with heat
+        run: |
+          # Dùng wix v3 heat.exe có sẵn trên GitHub Actions windows-latest
+          & "${env:WIX}bin\heat.exe" dir dist -cg AppDependencies -dr APPLICATIONFOLDER -scom -sreg -sfrag -srd -gg -out wix\dependencies.wxs
+          (Get-Content wix\dependencies.wxs) -replace 'SourceDir\\', 'dist\' | Set-Content wix\dependencies.wxs
+
+      - name: Build MSI Installer
+        run: cargo wix --nocapture -p win-glide -L -sval
+
+      - name: Rename Installer
+        run: |
+          Move-Item "target\wix\win-glide-*.msi" "target\wix\WinGlide-x86_64.msi"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target\wix\WinGlide-x86_64.msi
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

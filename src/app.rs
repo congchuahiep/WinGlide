@@ -158,6 +158,22 @@ impl App {
     /// Hàm này bắt buộc phải được chạy trên luồng main đã khởi tạo COM dưới dạng STA
     /// (`COINIT_APARTMENTTHREADED`).
     pub unsafe fn run(&mut self, main_thread_id: u32) -> anyhow::Result<()> {
+        std::thread::spawn(|| {
+            if let Ok(Some(update)) = crate::updater::check_for_updates() {
+                tracing::info!("Update available: {}", update.latest_version);
+                unsafe {
+                    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_OK, MB_ICONINFORMATION};
+                    use windows::core::w;
+                    MessageBoxW(
+                        None,
+                        w!("A new version of WinGlide is available! Please open Settings from the system tray to update."),
+                        w!("WinGlide Update"),
+                        MB_OK | MB_ICONINFORMATION,
+                    );
+                }
+            }
+        });
+
         if let Some(indicator) = &mut self.indicator_window {
             indicator.run();
         }
