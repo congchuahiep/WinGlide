@@ -1,12 +1,16 @@
 [package]
-name = "win-glide"
+name = "winglide"
 version = "0.0.1"
 authors = ["congchuahiep"]
 description = "A simple tool to improve Windows 11 navigation smoother: cycle taskbar buttons, uncombine taskbar buttons, jump to desktop,..."
 license = "MIT"
-repository = "https://github.com/congchuahiep/win-glide"
+repository = "https://github.com/congchuahiep/WinGlide"
 edition = "2021"
 exclude = ["docs/"]
+
+[[bin]]
+name = "WinGlide"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"

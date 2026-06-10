@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::env;
 use std::fs;
 
-const REPO_URL: &str = "https://api.github.com/repos/congchuahiep/win-glide/releases/latest";
+const REPO_URL: &str = "https://api.github.com/repos/congchuahiep/WinGlide/releases/latest";
 
 #[derive(Deserialize, Debug)]
 pub struct Release {
@@ -58,7 +58,7 @@ pub fn check_for_updates() -> Result<Option<UpdateInfo>> {
 
 pub fn download_and_install(url: &str) -> Result<()> {
     let mut temp_dir = env::temp_dir();
-    temp_dir.push("winglide_update.msi");
+    temp_dir.push("WinGlide_update.msi");
 
     let client = reqwest::blocking::Client::builder()
         .user_agent("WinGlide-Updater")
@@ -74,8 +74,8 @@ pub fn download_and_install(url: &str) -> Result<()> {
 
     // Chạy file msi bằng ShellExecuteW
     unsafe {
-        use windows::core::PCWSTR;
         use windows::core::w;
+        use windows::core::PCWSTR;
         use windows::Win32::UI::Shell::ShellExecuteW;
         use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 

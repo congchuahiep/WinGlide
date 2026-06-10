@@ -60,8 +60,8 @@
 
     <Product
         Id='*'
-        Name='win-glide'
-        UpgradeCode='1BB30ABE-92DF-434A-9F0A-658D6CC54A32'
+        Name='winglide'
+        UpgradeCode='B64CCFCF-124D-46DA-B5F9-1341E9C2546F'
         Manufacturer='congchuahiep'
         Language='1033'
         Codepage='1252'
@@ -69,7 +69,7 @@
 
         <Package Id='*'
             Keywords='Installer'
-            Description='Better Windows Navigate (Taskbar Switcher &amp; More)'
+            Description='A simple tool to improve Windows 11 navigation smoother: cycle taskbar buttons, uncombine taskbar buttons, jump to desktop,...'
             Manufacturer='congchuahiep'
             InstallerVersion='450'
             Languages='1033'
@@ -83,11 +83,11 @@
             DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
 
         <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
-        <Property Id='DiskPrompt' Value='win-glide Installation'/>
+        <Property Id='DiskPrompt' Value='winglide Installation'/>
 
         <Directory Id='TARGETDIR' Name='SourceDir'>
             <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
-                <Directory Id='APPLICATIONFOLDER' Name='win-glide'>
+                <Directory Id='APPLICATIONFOLDER' Name='winglide'>
                     <!--
                       Disabling the license sidecar file in the installer is a two step process:
 
@@ -95,19 +95,19 @@
                       2. Comment out or remove the `ComponentRef` tag with the "License" Id
                          attribute value further down in this file.
                     -->
-                    <!-- <Component Id='License' Guid='*'>
+                    <Component Id='License' Guid='*'>
                         <File Id='LicenseFile'
                             DiskId='1'
                             Source='wix\License.rtf'
                             KeyPath='yes'/>
-                    </Component> -->
+                    </Component>
                     
-                    <!-- <Directory Id='Bin' Name='bin'> -->
-                        <Component Id='Path' Guid='767C7670-A79E-49B6-9197-495DF14F1683' KeyPath='yes'>
+                    <Directory Id='Bin' Name='bin'>
+                        <Component Id='Path' Guid='D63F45E0-8A26-48F1-9622-DB93B412F208' KeyPath='yes'>
                             <Environment
                                 Id='PATH'
                                 Name='PATH'
-                                Value='[APPLICATIONFOLDER]'
+                                Value='[Bin]'
                                 Permanent='no'
                                 Part='last'
                                 Action='set'
@@ -116,12 +116,12 @@
                         <Component Id='binary0' Guid='*'>
                             <File
                                 Id='exe0'
-                                Name='win-glide.exe'
+                                Name='WinGlide.exe'
                                 DiskId='1'
-                                Source='$(var.CargoTargetBinDir)\win-glide.exe'
+                                Source='$(var.CargoTargetBinDir)\WinGlide.exe'
                                 KeyPath='yes'/>
                         </Component>
-                    <!-- </Directory> -->
+                    </Directory>
                 </Directory>
             </Directory>
         </Directory>
@@ -139,10 +139,9 @@
               Comment out or remove the following `ComponentRef` tag to remove
               the license sidecar file from the installer.
             -->
-            <!-- <ComponentRef Id='License'/> -->
+            <ComponentRef Id='License'/>
             
             <ComponentRef Id='binary0'/>
-            <ComponentGroupRef Id='AppDependencies'/>
 
             <Feature
                 Id='Environment'
@@ -163,10 +162,10 @@
           The product icon is the graphic that appears in the Add/Remove
           Programs control panel for the application.
         -->
-        <Icon Id='ProductICO' SourceFile='assets\icon.ico'/>
-        <Property Id='ARPPRODUCTICON' Value='ProductICO' />
+        <!--<Icon Id='ProductICO' SourceFile='wix\Product.ico'/>-->
+        <!--<Property Id='ARPPRODUCTICON' Value='ProductICO' />-->
 
-        <Property Id='ARPHELPLINK' Value='https://github.com/congchuahiep/win-glide'/>
+        <Property Id='ARPHELPLINK' Value='https://github.com/congchuahiep/WinGlide'/>
         
         <UI>
             <UIRef Id='WixUI_FeatureTree'/>
@@ -177,19 +176,16 @@
                  2. Comment out or remove the `<WiXVariable Id='WixUILicenseRtf'...` tag further down
 
             -->
-            <Publish Dialog='WelcomeDlg' Control='Next' Event='NewDialog' Value='CustomizeDlg' Order='99'>1</Publish>
-            <Publish Dialog='CustomizeDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg' Order='99'>1</Publish>
-
-            <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Run WinGlide" />
-            <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApplication">WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed</Publish>
+            <!--<Publish Dialog='WelcomeDlg' Control='Next' Event='NewDialog' Value='CustomizeDlg' Order='99'>1</Publish>-->
+            <!--<Publish Dialog='CustomizeDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg' Order='99'>1</Publish>-->
+            
         </UI>
-        <CustomAction Id="LaunchApplication" FileKey="exe0" ExeCommand="" Execute="immediate" Impersonate="yes" Return="asyncNoWait" />
 
         <!--
           Disabling the EULA dialog in the installer requires commenting out
           or removing the following `WixVariable` tag
         -->
-        <!-- <WixVariable Id='WixUILicenseRtf' Value='wix\License.rtf'/> -->
+        <WixVariable Id='WixUILicenseRtf' Value='wix\License.rtf'/>
         
         
         <!--

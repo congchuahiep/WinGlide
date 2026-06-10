@@ -1,14 +1,20 @@
 //! Root UI module cho Settings application.
 //! Nơi khởi tạo cấu trúc layout chính bao gồm Header, các mục Settings, Logging và Footer.
 
+use crate::config::AppConfig;
+use crate::setting::hotkey_button;
+use crate::setting::setting_item::{setting_item, SettingItemProps};
+use std::os::windows::io::AsRawHandle;
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows_core::w;
 use windows_reactor::*;
-
-use crate::config::AppConfig;
-use crate::setting::hotkey_button;
-use crate::setting::setting_item::{setting_item, SettingItemProps};
 
 /// Gửi tín hiệu tải lại cấu hình tới tiến trình chạy ngầm
 fn send_reload_signal() {
@@ -480,7 +486,7 @@ fn footer() -> Element {
             ShellExecuteW(
                 None,
                 w!("open"),
-                w!("https://github.com/congchuahiep/win-glide"),
+                w!("https://github.com/congchuahiep/WinGlide"),
                 None,
                 None,
                 SW_SHOWNORMAL,
@@ -516,14 +522,6 @@ pub fn show_ui() {
         .arg("--settings-ui")
         .spawn()
         .expect("Failed to spawn settings UI process");
-
-    use std::os::windows::io::AsRawHandle;
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    };
 
     static UI_JOB: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
 

@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 jobs:
   build:
@@ -40,11 +40,11 @@ jobs:
           & "${env:WIX}bin\heat.exe" dir dist -cg AppDependencies -dr APPLICATIONFOLDER -scom -sreg -sfrag -srd -gg -var var.DistDir -out wix\dependencies.wxs
 
       - name: Build MSI Installer
-        run: cargo wix --nocapture -p win-glide -C -dDistDir=dist -L -sval
+        run: cargo wix --nocapture -p winglide -C -dDistDir=dist -L -sval
 
       - name: Rename Installer
         run: |
-          Move-Item "target\wix\win-glide-*.msi" "target\wix\WinGlide-x86_64.msi"
+          Move-Item "target\wix\winglide-*.msi" "target\wix\WinGlide-x86_64.msi"
 
       - name: Create Release
         uses: softprops/action-gh-release@v2

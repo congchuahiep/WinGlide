@@ -3,28 +3,28 @@ use std::fs;
 use std::path::PathBuf;
 use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, VK_OEM_4, VK_OEM_6};
 
-/// Cấu hình chính của ứng dụng
+/// Main configuration struct for the application.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppConfig {
-    /// Chế độ Uncombine (Tránh group cửa sổ lại với nhau trên Taskbar)
+    /// prevents the taskbar buttons groups from being combined on the taskbar
     pub uncombine_mode: bool,
-    /// Chế độ Cycle dựa trên thứ tự các nút trên Taskbar
+    /// Cycle mode based on the order of taskbar buttons
     pub cycle_taskbar_based: bool,
 
-    /// Mã phím ảo (VK) của phím nóng di chuyển trái
+    /// Virtual key code (VK) of the hotkey to move left
     pub hotkey_left_vk: u32,
-    /// Các phím bổ trợ (Modifiers) của phím nóng di chuyển trái
+    /// Modifiers for the hotkey to move left
     pub hotkey_left_modifiers: u32,
 
-    /// Mã phím ảo (VK) của phím nóng di chuyển phải
+    /// Virtual key code (VK) of the hotkey to move right
     pub hotkey_right_vk: u32,
-    /// Các phím bổ trợ (Modifiers) của phím nóng di chuyển phải
+    /// Modifiers for the hotkey to move right
     pub hotkey_right_modifiers: u32,
 
-    /// Cho phép hiển thị Desktop Indicator
+    /// Allows displaying the Desktop Indicator
     pub desktop_indicator: bool,
 
-    /// Các phím bổ trợ cho Jump to Desktop (vd: Alt + <number>)
+    /// Modifiers for the Jump to Desktop hotkey (e.g. Alt + <number>)
     pub jump_desktop_modifiers: u32,
 }
 
@@ -44,16 +44,16 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// Lấy đường dẫn lưu file cấu hình (trong AppData/Roaming/"win-glide)
+    /// Get the path to the configuration file (in AppData/Roaming/"WinGlide")
     pub fn config_path() -> PathBuf {
         let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-        path.push("win-glide");
+        path.push("WinGlide");
         fs::create_dir_all(&path).ok();
         path.push("config.json");
         path
     }
 
-    /// Tải cấu hình từ file, nếu lỗi hoặc file không tồn tại thì trả về cấu hình mặc định
+    /// Load the configuration from the file, or return the default configuration if the file is not found or an error occurs.
     pub fn load() -> Self {
         let path = Self::config_path();
         match fs::read_to_string(&path) {
@@ -71,7 +71,6 @@ impl AppConfig {
                 }
             },
             Err(_) => {
-                // File chưa tồn tại, tạo mới với default
                 let default_config = Self::default();
                 default_config.save();
                 default_config
@@ -79,7 +78,7 @@ impl AppConfig {
         }
     }
 
-    /// Lưu cấu hình hiện tại xuống file
+    /// Save the current configuration to the file.
     pub fn save(&self) {
         let path = Self::config_path();
         match serde_json::to_string_pretty(self) {
