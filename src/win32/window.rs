@@ -19,7 +19,7 @@ use windows::Win32::{
     UI::WindowsAndMessaging::{
         EnumWindows, GetClassNameW, GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextW,
         GetWindowThreadProcessId, IsWindowVisible, GWL_EXSTYLE, GW_OWNER, WS_EX_APPWINDOW,
-        WS_EX_TOOLWINDOW,
+        WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
     },
 };
 use windows_core::BOOL;
@@ -77,7 +77,14 @@ unsafe extern "system" fn enum_windows_callback(
     let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
     let is_tool_window = (ex_style & WS_EX_TOOLWINDOW.0) != 0;
     let is_app_window = (ex_style & WS_EX_APPWINDOW.0) != 0;
+    let is_transparent_overlay =
+        (ex_style & WS_EX_TRANSPARENT.0) != 0 && (ex_style & WS_EX_LAYERED.0) != 0;
     let owner = GetWindow(hwnd, GW_OWNER);
+
+    // Bỏ qua các cửa sổ xuyên thấu click (Phantom/Overlay windows như Keyviz, Discord overlay)
+    if is_transparent_overlay {
+        return TRUE;
+    }
 
     if is_tool_window {
         return TRUE;
