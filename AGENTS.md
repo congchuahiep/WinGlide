@@ -41,6 +41,7 @@ event/winevent.rs           -> WinEvent EVENT_OBJECT_SHOW hook -> WM_APP_UNCOMBI
 types.rs                    -> shared data structs (TaskbarButton, WindowInfo, TargetWindow), no logic
 utils.rs                    -> clean_button_name, truncate, is_system_class
 temp.rs                     -> dead placeholder (add_one function) - ignore
+setting/                    -> windows_reactor native GUI for settings configuration
 logging/                    -> tracing-subscriber + tracing-forest, file output to ./logs/
 ```
 
@@ -82,14 +83,16 @@ Button-to-window matching tries 4 strategies in order:
 
 ### Windows 11 only
 
-- Relies on XAML taskbar class `Taskbar.TaskListButtonAutomationPeer`. Will not work on Windows 10 (which uses `ToolbarWindow32`). Only enumerates the **primary monitor** taskbar.
+- Relies on XAML taskbar class `Taskbar.TaskListButtonAutomationPeer`. Will not work on Windows 10 (which uses `ToolbarWindow32`). Supports both **primary** (`Shell_TrayWnd`) and **secondary** monitors (`Shell_SecondaryTrayWnd`).
 
 ### Hotkey IDs
 
-- Hotkey ID 1 = `Alt+[` (VK_OEM_4) -> Left
-- Hotkey ID 2 = `Alt+]` (VK_OEM_6) -> Right
+- Hotkey ID 1 = Left cycle (configurable via Settings GUI)
+- Hotkey ID 2 = Right cycle (configurable via Settings GUI)
 
 ### Custom window messages
 
 - `WM_APP_UNCOMBINE = WM_USER + 0x100` - uncombine a new window
 - `WM_APP_INVALIDATE_CACHE = WM_USER + 0x101` - invalidate button cache
+- `WM_APP_RELOAD_CONFIG` - signal background process to reload configuration
+- `WM_APP_RESTART_AS_ADMIN` - signal to restart app with admin privileges

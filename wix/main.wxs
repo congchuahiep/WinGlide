@@ -221,7 +221,14 @@
             <!--<Publish Dialog='WelcomeDlg' Control='Next' Event='NewDialog' Value='CustomizeDlg' Order='99'>1</Publish>-->
             <!--<Publish Dialog='CustomizeDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg' Order='99'>1</Publish>-->
 
-            <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" />
+            <Publish
+                Dialog="ExitDialog"
+                Control="Finish"
+                Event="DoAction"
+                Value="LaunchApplication"
+            >
+                WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed
+            </Publish>
         </UI>
 
         <!--
