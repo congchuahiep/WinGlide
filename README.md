@@ -98,13 +98,13 @@ cargo run -- --debug --verbose
 
 | Component               | Technology                                  |
 | ----------------------- | ------------------------------------------- |
-| **Language**            | Rust (Edition 2021)                         |
 | **Windows API**         | `windows-rs` 0.61                           |
 | **Taskbar Enumeration** | IUIAutomation (UIA)                         |
 | **Window Matching**     | `EnumWindows` + `GetWindowTextW`            |
 | **Window Activation**   | `SetForegroundWindow` + `AttachThreadInput` |
 | **Global Hotkeys**      | `RegisterHotKey` + `GetMessageW`            |
 | **Virtual Desktops**    | `winvd`                                     |
+| **ui**                  | `windows-reactor`                           |
 
 ## Limitations & Requirements
 
