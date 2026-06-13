@@ -6,11 +6,11 @@ A powerful, lightweight utility built in Rust designed to enhance navigation and
 
 <table>
   <tr>
-    <td>
+    <td width="30%">
       <b>Cycle windows based on taskbar buttons</b>: Use <code>Alt + [</code> and <code>Alt + ]</code> to instantly cycle through open applications on your taskbar (Left/Right).
     </td>
     <td>
-      <video src="https://github.com/user-attachments/assets/46faf7d0-0227-45b4-b0c4-01e6a4e78797" controls width="320"></video>
+      <video src="https://github.com/user-attachments/assets/46faf7d0-0227-45b4-b0c4-01e6a4e78797" controls width="600"></video>
     </td>
   </tr>
   <tr>
@@ -18,7 +18,7 @@ A powerful, lightweight utility built in Rust designed to enhance navigation and
       <b>Uncombine Taskbar Buttons</b>: Prevents taskbar buttons from being grouped together, giving you individual buttons for each window.
     </td>
     <td>
-      <video src="https://github.com/user-attachments/assets/c2d74899-5966-47dc-a678-f8df698e1485" controls width="320"></video>
+      <video src="https://github.com/user-attachments/assets/c2d74899-5966-47dc-a678-f8df698e1485" controls width="600"></video>
     </td>
   </tr>
   <tr>
@@ -26,7 +26,7 @@ A powerful, lightweight utility built in Rust designed to enhance navigation and
       <b>Virtual Desktop Indicator</b>: Displays a visual indicator of your current virtual desktop position directly on the taskbar.
     </td>
     <td>
-      <video src="https://github.com/user-attachments/assets/1d41a096-5139-45ff-8675-7cea09de6e1a" controls width="320"></video>
+      <video src="https://github.com/user-attachments/assets/1d41a096-5139-45ff-8675-7cea09de6e1a" controls width="600"></video>
     </td>
   </tr>
   <tr>
@@ -34,7 +34,7 @@ A powerful, lightweight utility built in Rust designed to enhance navigation and
       <b>Jump to Desktop</b>: Quickly jump to a specific virtual desktop using <code>Alt + &lt;index&gt;</code> (starting from 1).
     </td>
     <td>
-      <video src="https://github.com/user-attachments/assets/6f77acad-0fb5-42c3-adc2-1f8916c1f351" controls width="320"></video>
+      <video src="https://github.com/user-attachments/assets/6f77acad-0fb5-42c3-adc2-1f8916c1f351" controls width="600"></video>
     </td>
   </tr>
   <tr>
