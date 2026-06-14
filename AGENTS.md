@@ -12,7 +12,6 @@ cargo build                        # debug build
 cargo check                        # quick type-check (no codegen needed)
 ./target/release/WinGlide.exe            # normal run
 ./target/release/WinGlide.exe -v         # with debug logging
-./target/release/WinGlide.exe --combine-mode  # keep taskbar buttons grouped
 ```
 
 No lint/formatter config exists in the repo - only `cargo check` / `cargo build` are available.
@@ -20,7 +19,7 @@ No lint/formatter config exists in the repo - only `cargo check` / `cargo build`
 ## CLI args (manual parsing, no clap)
 
 - `-v` / `--verbose` - enable debug-level console/file logging
-- `--combine-mode` - keep taskbar buttons combined (skip uncombine)
+- `--debug` - enable debug logging console when open app
 
 ## Architecture
 
