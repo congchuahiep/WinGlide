@@ -20,11 +20,12 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::config::AppConfig;
 use crate::event::{self, InvalidateSource};
 use crate::hotkey::{HotkeyAction, HotkeyManager};
-use crate::virtual_desktop::indicator::IndicatorWindow;
 use crate::logging::console::{self, CONSOLE_VISIBLE};
 use crate::setting;
 use crate::taskbar::{CycleDirection, TaskbarEnumerator, UncombineManager};
 use crate::tray_icon::{TrayIcon, IDM_EXIT, IDM_SETTINGS, IDM_SHOW_CONSOLE};
+use crate::virtual_desktop::indicator::IndicatorWindow;
+use crate::win32::window_context::WindowContext;
 
 /// Dynamic Windows message identifier "TaskbarCreated".
 /// This message is sent when the Explorer process restarts.
@@ -451,6 +452,27 @@ impl App {
                 let _guard = debug_span!("hotkey", action = "switch_virtual_desktop", index);
                 if let Err(e) = winvd::switch_desktop(index) {
                     error!("Failed to switch virtual desktop {}: {:?}", index, e);
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(50)); // Allow time for OS to process the desktop switch
+
+                    let current_context = WindowContext::current_state();
+                    if let Some(current_desktop) = current_context.virtual_desktop {
+                        let windows =
+                            crate::win32::window::find_visible_windows(Some(&current_context));
+
+                        for win in windows {
+                            let winvd_hwnd = unsafe { std::mem::transmute(win.hwnd) };
+
+                            if let Ok(win_desktop) = winvd::get_desktop_by_window(winvd_hwnd) {
+                                if win_desktop == current_desktop {
+                                    unsafe {
+                                        crate::win32::activate::force_activate(win.hwnd);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
             }
             None => {}
