@@ -44,11 +44,11 @@ use windows::Win32::UI::Shell::IVirtualDesktopManager;
 use windows::Win32::UI::Shell::VirtualDesktopManager;
 use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, FindWindowW, GetForegroundWindow};
 
+use super::button_window::ButtonWindowMap;
 use crate::event::UiaEventHook;
 use crate::types::{TargetWindow, TaskbarButton};
 use crate::utils::truncate;
 use crate::win32::activate::force_activate;
-use super::button_window::ButtonWindowMap;
 use crate::win32::explorer::invalidate_explorer_pid_cache;
 use crate::win32::window::find_visible_windows;
 use crate::win32::window_context::WindowContext;
