@@ -63,7 +63,7 @@ event/
 ├── uia.rs                  -> UIA StructureChanged hook -> WM_APP_INVALIDATE_CACHE (0x101)
 └── winevent.rs             -> WinEvent EVENT_OBJECT_SHOW hook -> WM_APP_UNCOMBINE (0x100)
 virtual_desktop/
-└── indicator.rs            -> IndicatorWindow: layered window drawing desktop dots on the taskbar (winvd)
+└── indicator.rs            -> IndicatorWindow: layered window drawing desktop dots on the taskbar (winvd); click = switch desktop, Alt+click = move foreground window there
 tray_icon.rs                -> Shell_NotifyIconW tray icon + context menu (Exit / Settings / Debug Console)
 setting/                    -> windows-reactor native GUI settings (hotkey capture, toggles, update check)
 logging/                    -> tracing-subscriber: rolling file + detached console via named pipes; tracing-forest format
@@ -158,4 +158,5 @@ Button-to-window matching tries 4 strategies in order:
 
 - `switch_desktop` + `WindowContext::current_state()` are used to re-activate a window on the target desktop after switching (`App::handle_hotkey` -> `SwitchVirtualDesktop`).
 - `IndicatorWindow` is an owned layered window of `Shell_TrayWnd`; it gets cloaked by DWM when Task View (`Win+Tab`) opens - known limitation.
+- **Move window to desktop via indicator**: with `Alt` held, clicking a desktop dot moves the foreground window to that desktop (via `winvd::move_window_to_desktop`), switches there, and re-activates it (`force_activate`). Requires the `transmute` of the HWND into winvd's `windows`-0.58 type. Pinned (all-desktops) windows are ignored.
 - Hotkey auto-repeat protection

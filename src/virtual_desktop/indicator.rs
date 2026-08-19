@@ -1,7 +1,7 @@
 //! Indicator window displaying status on the Taskbar.
 
 use std::slice::from_raw_parts_mut;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 use windows::core::w;
 use windows::Win32::Foundation::*;
@@ -11,10 +11,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse;
 use windows::Win32::UI::WindowsAndMessaging::{self, *};
 
 use crate::utils;
+use crate::win32::activate::force_activate;
 
 const WM_APP_VD_EVENT: u32 = WM_USER + 0x100;
 
 static HOVER_INDEX: AtomicIsize = AtomicIsize::new(-1);
+
+/// Tracks whether the "move window" modifier (Alt) is down, so the indicator
+/// can re-render (and switch cursor) when the mode toggles.
+static MOVE_MODE: AtomicBool = AtomicBool::new(false);
 
 fn get_hovered_index(x: i32) -> Option<usize> {
     unsafe {
@@ -43,6 +48,78 @@ fn get_hovered_index(x: i32) -> Option<usize> {
             }
         }
         None
+    }
+}
+
+/// True while the "move window to desktop" modifier (Alt) is held.
+fn move_modifier_down() -> bool {
+    unsafe { (KeyboardAndMouse::GetAsyncKeyState(KeyboardAndMouse::VK_MENU.0 as i32)) < 0 }
+}
+
+/// Returns `true` if the move-modifier state changed since the last check,
+/// so the indicator knows to re-render when the user toggles Alt while hovering.
+fn move_mode_changed() -> bool {
+    let current = move_modifier_down();
+    let old = MOVE_MODE.load(Ordering::Relaxed);
+    if current != old {
+        MOVE_MODE.store(current, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
+/// The current foreground application window, rejecting system/hidden windows.
+/// Returns `None` if there is no suitable window to move.
+fn foreground_target_window() -> Option<HWND> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_invalid() {
+            return None;
+        }
+        if !IsWindowVisible(hwnd).as_bool() {
+            return None;
+        }
+        let mut class_buf = [0u16; 256];
+        let len = GetClassNameW(hwnd, &mut class_buf);
+        if len > 0 {
+            let class_name = String::from_utf16_lossy(&class_buf[..len as usize]);
+            if utils::is_system_class(&class_name) || class_name == "WinGlideTray" {
+                return None;
+            }
+        }
+        Some(hwnd)
+    }
+}
+
+/// Moves the current foreground window to `target` desktop and switches to it.
+/// No-op when the window is already there or cannot be moved.
+fn move_foreground_to_desktop(target: &winvd::Desktop) {
+    let Some(hwnd) = foreground_target_window() else {
+        return;
+    };
+
+    // winvd links a different `windows` crate version, so the HWND must be
+    // transmuted (both are transparent wrappers over a pointer).
+    let whwnd = unsafe { std::mem::transmute(hwnd) };
+
+    // Pinned (all-desktops) windows can't be moved.
+    if winvd::is_pinned_window(whwnd).unwrap_or(false) {
+        return;
+    }
+
+    // Already on the target desktop -> nothing to do.
+    if let Ok(win_desktop) = winvd::get_desktop_by_window(whwnd) {
+        if &win_desktop == target {
+            return;
+        }
+    }
+
+    if winvd::move_window_to_desktop(*target, &whwnd).is_ok() {
+        // Follow the window to the target desktop and bring it to the front.
+        let _ = winvd::switch_desktop(*target);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        unsafe { force_activate(hwnd) };
     }
 }
 
@@ -214,6 +291,7 @@ impl IndicatorWindow {
                 }
 
                 let hover_idx = HOVER_INDEX.load(Ordering::Relaxed);
+                let move_mode = move_modifier_down();
 
                 for i in 0..count {
                     let cx = start_x + (i as f32) * spacing;
@@ -229,6 +307,7 @@ impl IndicatorWindow {
                         spacing,
                         is_hovered,
                         hitbox_theme_color,
+                        move_mode,
                     );
 
                     let is_active = i == current_idx;
@@ -308,6 +387,7 @@ impl IndicatorWindow {
         spacing: f32,
         is_hovered: bool,
         theme_color: (u8, u8, u8),
+        move_mode: bool,
     ) {
         let half_spacing = spacing / 2.0;
         let min_x = (cx - half_spacing).floor().max(0.0) as i32;
@@ -330,7 +410,17 @@ impl IndicatorWindow {
 
         let inner_w = bg_rw - corner_radius;
         let inner_h = bg_rh - corner_radius;
-        let (r, g, b) = theme_color;
+        // In "move" mode (Alt held) tint the hover background with an accent color
+        // to signal that a click will move the current window to that desktop.
+        let (r, g, b) = if move_mode {
+            if utils::is_light_theme() {
+                (0, 92, 175)
+            } else {
+                (110, 170, 255)
+            }
+        } else {
+            theme_color
+        };
 
         let base_alpha = 0.3; // Transparency of hover background
 
@@ -461,7 +551,7 @@ impl IndicatorWindow {
                 let old = HOVER_INDEX.load(std::sync::atomic::Ordering::Relaxed);
                 let new_val = hovered.map(|i| i as isize).unwrap_or(-1);
 
-                if old != new_val {
+                if old != new_val || move_mode_changed() {
                     HOVER_INDEX.store(new_val, std::sync::atomic::Ordering::Relaxed);
                     Self::render(hwnd);
 
@@ -487,7 +577,12 @@ impl IndicatorWindow {
                 if let Some(idx) = get_hovered_index(x) {
                     if let Ok(desktops) = winvd::get_desktops() {
                         if idx < desktops.len() {
-                            let _ = winvd::switch_desktop(desktops[idx]);
+                            if move_modifier_down() {
+                                // Alt + click: move the foreground window to that desktop.
+                                move_foreground_to_desktop(&desktops[idx]);
+                            } else {
+                                let _ = winvd::switch_desktop(desktops[idx]);
+                            }
                         }
                     }
                 }
@@ -495,11 +590,14 @@ impl IndicatorWindow {
             }
             WindowsAndMessaging::WM_SETCURSOR => {
                 unsafe {
-                    let cursor = WindowsAndMessaging::LoadCursorW(
-                        None,
+                    let cursor_id = if move_modifier_down() {
+                        WindowsAndMessaging::IDC_SIZEALL
+                    } else {
                         WindowsAndMessaging::IDC_HAND
-                    ).unwrap();
-                    let _ = WindowsAndMessaging::SetCursor(Some(cursor));
+                    };
+                    if let Ok(cursor) = WindowsAndMessaging::LoadCursorW(None, cursor_id) {
+                        let _ = WindowsAndMessaging::SetCursor(Some(cursor));
+                    }
                 }
                 LRESULT(1)
             }
@@ -515,4 +613,3 @@ impl Drop for IndicatorWindow {
         }
     }
 }
-
