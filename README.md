@@ -16,16 +16,16 @@ I built WinGlide to supercharge productivity by keeping your hands on the keyboa
 
 ## Features
 
-| Feature | Description | Demo |
-| --- | --- | --- |
-| **Cycle taskbar windows** | Use `Alt + [` / `Alt + ]` to instantly cycle through open applications on your taskbar (Left/Right). | <video src="https://github.com/user-attachments/assets/46faf7d0-0227-45b4-b0c4-01e6a4e78797" controls preload="metadata" width="320"></video> |
-| **Uncombine taskbar buttons** | Prevents taskbar buttons from being grouped together, giving you an individual button for each window. | <video src="https://github.com/user-attachments/assets/c2d74899-5966-47dc-a678-f8df698e1485" controls preload="metadata" width="320"></video> |
-| **Virtual desktop indicator** | A compact indicator on the taskbar shows which virtual desktop you're on; click a dot to switch. | <video src="https://github.com/user-attachments/assets/1d41a096-5139-45ff-8675-7cea09de6e1a" controls preload="metadata" width="320"></video> |
-| **Move window to desktop** | Right-click a desktop dot to move the current window there ("Move" or "Move and jump"), or `Alt` + click a dot for a quick move-and-jump. | <sub>(demo coming soon)</sub> |
-| **Jump to desktop** | Quickly jump to a specific virtual desktop using `Alt + <index>` (starting from 1). | <video src="https://github.com/user-attachments/assets/6f77acad-0fb5-42c3-adc2-1f8916c1f351" controls preload="metadata" width="320"></video> |
-| **System Tray Integration** | Easily manage the app via a convenient system tray menu. | — |
-| **Lightweight & Fast** | Built with Rust for maximum performance and minimal resource usage (<10Mb ram usage). | — |
-| **Free** | Free to use, why not? | — |
+| Feature                       | Description                                                                                                                                        | Demo                                                                                                                                          |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Cycle taskbar windows**     | Use <kbd>Alt</kbd> + <kbd>[</kbd> / <kbd>Alt</kbd> + <kbd>]</kbd> to instantly cycle through open applications on your taskbar (Left/Right).       | <video src="https://github.com/user-attachments/assets/46faf7d0-0227-45b4-b0c4-01e6a4e78797" controls preload="metadata" width="320"></video> |
+| **Uncombine taskbar buttons** | Prevents taskbar buttons from being grouped together, giving you an individual button for each window.                                             | <video src="https://github.com/user-attachments/assets/c2d74899-5966-47dc-a678-f8df698e1485" controls preload="metadata" width="320"></video> |
+| **Virtual desktop indicator** | A compact indicator on the taskbar shows which virtual desktop you're on; click a dot to switch.                                                   | <video src="https://github.com/user-attachments/assets/1d41a096-5139-45ff-8675-7cea09de6e1a" controls preload="metadata" width="320"></video> |
+| **Jump to desktop**           | Quickly jump to a specific virtual desktop using <kbd>Alt</kbd> + <kbd>&lt;index&gt;</kbd> (starting from 1).                                      | <video src="https://github.com/user-attachments/assets/6f77acad-0fb5-42c3-adc2-1f8916c1f351" controls preload="metadata" width="320"></video> |
+| **Move window to desktop**    | Right-click a desktop dot to move the current window there ("Move" or "Move and jump"), or <kbd>Alt</kbd> + click a dot for a quick move-and-jump. |                                                                                                                                               |
+| **System Tray Integration**   | Easily manage the app via a convenient system tray menu.                                                                                           |                                                                                                                                               |
+| **Lightweight & Fast**        | Built with Rust for maximum performance and minimal resource usage (<10Mb ram usage).                                                              |                                                                                                                                               |
+| **Free**                      | Why not?                                                                                                                                           |                                                                                                                                               |
 
 ## Installation
 
