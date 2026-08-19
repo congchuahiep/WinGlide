@@ -1,9 +1,9 @@
 //! Indicator window displaying status on the Taskbar.
 
 use std::slice::from_raw_parts_mut;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
 
-use windows::core::w;
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -15,11 +15,21 @@ use crate::win32::activate::force_activate;
 
 const WM_APP_VD_EVENT: u32 = WM_USER + 0x100;
 
+/// Command-ID base for the "Move to Desktop" context menu items.
+const MENU_MOVE_BASE: usize = 1000;
+
 static HOVER_INDEX: AtomicIsize = AtomicIsize::new(-1);
 
 /// Tracks whether the "move window" modifier (Alt) is down, so the indicator
 /// can re-render (and switch cursor) when the mode toggles.
 static MOVE_MODE: AtomicBool = AtomicBool::new(false);
+
+/// The window targeted by the right-click "Move to Desktop" menu (captured
+/// before the indicator temporarily takes foreground to show the menu).
+static MOVE_TARGET_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// The desktop index of the dot that was right-clicked (for the move menu).
+static MOVE_TARGET_INDEX: AtomicI32 = AtomicI32::new(-1);
 
 fn get_hovered_index(x: i32) -> Option<usize> {
     unsafe {
@@ -84,7 +94,11 @@ fn foreground_target_window() -> Option<HWND> {
         let len = GetClassNameW(hwnd, &mut class_buf);
         if len > 0 {
             let class_name = String::from_utf16_lossy(&class_buf[..len as usize]);
-            if utils::is_system_class(&class_name) || class_name == "WinGlideTray" {
+            // Never treat our own windows (tray / indicator) as move targets.
+            if utils::is_system_class(&class_name)
+                || class_name == "WinGlideTray"
+                || class_name == "TaskbarSwitcherIndicator"
+            {
                 return None;
             }
         }
@@ -92,34 +106,140 @@ fn foreground_target_window() -> Option<HWND> {
     }
 }
 
-/// Moves the current foreground window to `target` desktop and switches to it.
-/// No-op when the window is already there or cannot be moved.
-fn move_foreground_to_desktop(target: &winvd::Desktop) {
-    let Some(hwnd) = foreground_target_window() else {
-        return;
-    };
-
+/// Moves `hwnd` to `target` desktop without switching. Returns `true` when the
+/// window was actually moved (it can't be when the window is pinned or already
+/// on `target`).
+fn move_window_to_desktop_only(hwnd: HWND, target: &winvd::Desktop) -> bool {
     // winvd links a different `windows` crate version, so the HWND must be
     // transmuted (both are transparent wrappers over a pointer).
     let whwnd = unsafe { std::mem::transmute(hwnd) };
 
     // Pinned (all-desktops) windows can't be moved.
     if winvd::is_pinned_window(whwnd).unwrap_or(false) {
-        return;
+        return false;
     }
 
     // Already on the target desktop -> nothing to do.
     if let Ok(win_desktop) = winvd::get_desktop_by_window(whwnd) {
         if &win_desktop == target {
-            return;
+            return false;
         }
     }
 
-    if winvd::move_window_to_desktop(*target, &whwnd).is_ok() {
-        // Follow the window to the target desktop and bring it to the front.
+    winvd::move_window_to_desktop(*target, &whwnd).is_ok()
+}
+
+/// Moves `hwnd` to `target` desktop, switches to it and re-activates the window.
+fn move_and_jump_to_desktop(hwnd: HWND, target: &winvd::Desktop) {
+    if move_window_to_desktop_only(hwnd, target) {
         let _ = winvd::switch_desktop(*target);
         std::thread::sleep(std::time::Duration::from_millis(50));
         unsafe { force_activate(hwnd) };
+    }
+}
+
+/// Moves the current foreground window to `target` desktop and jumps to it.
+fn move_foreground_to_desktop(target: &winvd::Desktop) {
+    if let Some(hwnd) = foreground_target_window() {
+        move_and_jump_to_desktop(hwnd, target);
+    }
+}
+
+/// Null-terminated UTF-16 copy of `s` for Win32 string parameters.
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Shows the "Move to Desktop N" context menu. `desktop_idx` is the index of
+/// the desktop whose dot was right-clicked, so `N` is known.
+/// The window title goes in a disabled header so the menu items stay short.
+fn show_move_menu(indicator_hwnd: HWND, target_hwnd: HWND, desktop_idx: usize) {
+    unsafe {
+        let desktops = match winvd::get_desktops() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        if desktop_idx >= desktops.len() {
+            return;
+        }
+
+        let target = &desktops[desktop_idx];
+        let n = desktop_idx + 1; // 1-based label
+
+        let mut title_buf = [0u16; 256];
+        let len = GetWindowTextW(target_hwnd, &mut title_buf);
+        let title = if len > 0 {
+            utils::truncate(&String::from_utf16_lossy(&title_buf[..len as usize]), 40)
+        } else {
+            "current window".to_string()
+        };
+
+        // Gray "move" out when the window is already on the right-clicked desktop.
+        let current = winvd::get_desktop_by_window(std::mem::transmute(target_hwnd)).ok();
+        let already_here = Some(target) == current.as_ref();
+
+        let Ok(hmenu) = CreatePopupMenu() else { return };
+
+        // Header: the window title (disabled), then the two short actions.
+        let header_wide = wide(&format!("\"{title}\""));
+        let _ = AppendMenuW(
+            hmenu,
+            MF_STRING | MF_DISABLED | MF_GRAYED,
+            0,
+            PCWSTR(header_wide.as_ptr()),
+        );
+        let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
+
+        let move_label = wide(&format!("Move to Desktop {n}"));
+        let _ = AppendMenuW(
+            hmenu,
+            if already_here {
+                MF_STRING | MF_DISABLED | MF_GRAYED
+            } else {
+                MF_STRING
+            },
+            MENU_MOVE_BASE,
+            PCWSTR(move_label.as_ptr()),
+        );
+
+        let jump_label = wide(&format!("Move and jump to Desktop {n}"));
+        let _ = AppendMenuW(
+            hmenu,
+            MF_STRING,
+            MENU_MOVE_BASE + 1,
+            PCWSTR(jump_label.as_ptr()),
+        );
+
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+
+        // TrackPopupMenu needs its owner window to be foreground. The indicator
+        // is WS_EX_NOACTIVATE, so temporarily clear that style while the menu is
+        // shown (the target window was captured before we took foreground).
+        let ex_style = GetWindowLongW(indicator_hwnd, GWL_EXSTYLE);
+        let _ = SetWindowLongW(
+            indicator_hwnd,
+            GWL_EXSTYLE,
+            (ex_style as u32 & !WS_EX_NOACTIVATE.0) as i32,
+        );
+        let _ = SetForegroundWindow(indicator_hwnd);
+        let _ = TrackPopupMenu(
+            hmenu,
+            TPM_LEFTALIGN | TPM_RIGHTBUTTON,
+            pt.x,
+            pt.y,
+            None,
+            indicator_hwnd,
+            None,
+        );
+        let _ = SetWindowLongW(indicator_hwnd, GWL_EXSTYLE, ex_style);
+
+        let _ = DestroyMenu(hmenu);
+
+        // Give focus back to the app window so the indicator doesn't linger as
+        // the foreground window (which would make the next right-click target
+        // the indicator itself instead of the app).
+        force_activate(target_hwnd);
     }
 }
 
@@ -582,6 +702,41 @@ impl IndicatorWindow {
                                 move_foreground_to_desktop(&desktops[idx]);
                             } else {
                                 let _ = winvd::switch_desktop(desktops[idx]);
+                            }
+                        }
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_RBUTTONUP => {
+                let x = ((lparam.0 as i32) << 16) >> 16;
+                // The right-clicked dot tells us exactly which desktop N to act on.
+                // Capture the target first: showing the menu temporarily takes
+                // foreground, so we can't derive it again from GetForegroundWindow.
+                if let Some(idx) = get_hovered_index(x) {
+                    if let Some(target) = foreground_target_window() {
+                        MOVE_TARGET_HWND.store(target.0 as isize, Ordering::Relaxed);
+                        MOVE_TARGET_INDEX.store(idx as i32, Ordering::Relaxed);
+                        show_move_menu(hwnd, target, idx);
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_COMMAND => {
+                let id = (wparam.0 as u32) & 0xFFFF;
+                if id == MENU_MOVE_BASE as u32 || id == (MENU_MOVE_BASE + 1) as u32 {
+                    let ptr = MOVE_TARGET_HWND.load(Ordering::Relaxed);
+                    let idx = MOVE_TARGET_INDEX.load(Ordering::Relaxed);
+                    if ptr != 0 && idx >= 0 {
+                        let target = HWND(ptr as *mut _);
+                        if let Ok(desktops) = winvd::get_desktops() {
+                            let i = idx as usize;
+                            if i < desktops.len() {
+                                if id == MENU_MOVE_BASE as u32 {
+                                    move_window_to_desktop_only(target, &desktops[i]);
+                                } else {
+                                    move_and_jump_to_desktop(target, &desktops[i]);
+                                }
                             }
                         }
                     }
