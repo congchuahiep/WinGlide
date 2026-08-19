@@ -29,6 +29,10 @@ pub struct AppConfig {
     /// Allows displaying the Desktop Indicator
     pub desktop_indicator: bool,
 
+    /// Placement of the Desktop Indicator: 0 = Auto, 1 = Left, 2 = Right
+    #[serde(default)]
+    pub indicator_position: u8,
+
     /// Modifiers for the Jump to Desktop hotkey (e.g. Alt + <number>)
     pub jump_desktop_modifiers: u32,
 }
@@ -43,6 +47,7 @@ impl Default for AppConfig {
             hotkey_right_vk: VK_OEM_6.0 as u32,
             hotkey_right_modifiers: MOD_ALT.0 as u32,
             desktop_indicator: true,
+            indicator_position: 0, // Auto
             jump_desktop_modifiers: MOD_ALT.0 as u32,
         }
     }

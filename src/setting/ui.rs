@@ -238,9 +238,10 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
 
     let update_modifier = {
         let set_config = set_config.clone();
-        let config_state = config.clone();
         std::rc::Rc::new(move |mod_flag: u32, is_checked: bool| {
-            let mut new_config = config_state.clone();
+            // Load fresh config: native controls can keep a stale handler after
+            // re-renders, so never compute from captured state.
+            let mut new_config = crate::config::AppConfig::load();
             if is_checked {
                 new_config.jump_desktop_modifiers |= mod_flag;
             } else {
@@ -269,6 +270,47 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
         })
         .vertical_alignment(VerticalAlignment::Center);
 
+    // Indicator placement: a compact DropDownButton showing the current
+    // preset, with a flyout to pick Auto / Left / Right.
+    let position_label = match config.indicator_position {
+        1 => "Left",
+        2 => "Right",
+        _ => "Auto",
+    };
+    let position_action: Element = drop_down_button(position_label)
+        .menu_flyout(vec![
+            menu_item("Auto"),
+            menu_item("Left"),
+            menu_item("Right"),
+        ])
+        .on_flyout_item_click({
+            let set_config = set_config.clone();
+            move |text: String| {
+                let new_pos = match text.as_str() {
+                    "Left" => 1,
+                    "Right" => 2,
+                    _ => 0,
+                };
+                // Load fresh config: the flyout keeps a stale handler after
+                // re-renders (items unchanged => reactor skips rewiring), so
+                // relying on captured state makes re-selecting the initial
+                // value a no-op.
+                let mut new_config = crate::config::AppConfig::load();
+                if new_pos == new_config.indicator_position {
+                    return;
+                }
+                new_config.indicator_position = new_pos;
+                new_config.save();
+                set_config.call(new_config);
+                send_reload_signal();
+            }
+        })
+        .into();
+    let position_action = position_action.margin(Thickness {
+        right: 10.,
+        ..Default::default()
+    });
+
     vstack((
         body_strong("Virtual Desktop").margin(Thickness {
             bottom: 10.,
@@ -287,9 +329,8 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
                         .width(42.)
                         .on_changed({
                             let set_config = set_config.clone();
-                            let config_state = config.clone();
                             move |checked| {
-                                let mut new_config = config_state.clone();
+                                let mut new_config = crate::config::AppConfig::load();
                                 new_config.desktop_indicator = checked;
                                 new_config.save();
                                 set_config.call(new_config);
@@ -298,8 +339,26 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
                         })
                         .into(),
                 ),
-                children: None,
-                always_expand: false,
+                children: Some(vec![SettingItemProps {
+                    icon: None,
+                    title: None,
+                    description: Some(
+                        "Click a dot to switch to that desktop. Hold Alt + click to move the current window there. Right-click a dot to open a 'Move to Desktop' menu.".into(),
+                    ),
+                    action: None,
+                    children: None,
+                    always_expand: false,
+                    enabled: config.desktop_indicator,
+                }, SettingItemProps {
+                    icon: None,
+                    title: Some("Position".into()),
+                    description: Some("Placement of the indicator on the taskbar".into()),
+                    action: Some(position_action.into()),
+                    children: None,
+                    always_expand: false,
+                    enabled: config.desktop_indicator,
+                }]),
+                always_expand: true,
                 enabled: true,
             },
             cx,

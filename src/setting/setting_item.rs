@@ -46,11 +46,12 @@ fn render_inner_layout(
             .into()
     });
 
-    let content = vstack((title, description_el)).padding(Thickness {
-        top: 4.,
-        bottom: 4.,
-        ..Default::default()
-    });
+    // NOTE: the padding below is applied to a Border wrapper, not the vstack
+    // itself. windows-reactor only forwards `Padding` to elements that are a
+    // WinUI `Control` or `Border`; a `StackPanel`/`Grid` is a `Panel`, so a
+    // `.padding()` directly on them is silently dropped (logged as
+    // `unhandled_modifier`). Border honors Padding in layout, so wrap it.
+    let content = border(vstack((title, description_el)));
 
     // Group properties dependent on the icon to calculate once
     let (icon_el, icon_col_width, content_margin_left) = match props.icon {
@@ -68,6 +69,11 @@ fn render_inner_layout(
     grid((
         icon_el,
         content
+            .padding(Thickness {
+                top: 8.,
+                bottom: 8.,
+                ..Default::default()
+            })
             .margin(Thickness {
                 left: content_margin_left,
                 top: 0.0,

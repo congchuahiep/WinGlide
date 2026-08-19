@@ -1,7 +1,7 @@
 //! Indicator window displaying status on the Taskbar.
 
 use std::slice::from_raw_parts_mut;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU8, Ordering};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
@@ -15,8 +15,42 @@ use crate::win32::activate::force_activate;
 
 const WM_APP_VD_EVENT: u32 = WM_USER + 0x100;
 
+/// Gap kept between the indicator and the taskbar edge / system tray.
+const INDICATOR_MARGIN: i32 = 6;
 /// Command-ID base for the "Move to Desktop" context menu items.
 const MENU_MOVE_BASE: usize = 1000;
+
+/// Shared geometry of the virtual-desktop dots. Used both when rendering and
+/// when hit-testing the mouse, so the hover zones always line up with the dots.
+struct DotLayout {
+    radius: f32,
+    spacing: f32,
+    start_x: f32,
+}
+
+fn dot_layout(height: i32) -> DotLayout {
+    // Taskbar at 1080p is usually 48px high, at 4K (200%) it's 96px high.
+    // Binding to Taskbar height keeps the aspect ratio 100% accurate on all screens.
+    let radius = height as f32 * 0.07; // Radius = 7% height (equivalent to ~3.36px at 1080p)
+    let spacing = radius * 5.0;
+    let start_x = 10.0 + radius;
+    DotLayout {
+        radius,
+        spacing,
+        start_x,
+    }
+}
+
+/// Total window width needed so the last dot (and its hover hitbox) is fully
+/// visible. Derived from the desktop count instead of a fixed constant: adding
+/// desktops never clips the indicator, and few desktops don't leave a dead zone.
+fn indicator_width(height: i32, count: usize) -> i32 {
+    let layout = dot_layout(height);
+    let last_center = layout.start_x + count.saturating_sub(1) as f32 * layout.spacing;
+    // The last hitbox extends half a spacing past its center; the enlarged dot
+    // (1.25x radius when active/hovered) is always smaller than that.
+    (last_center + layout.spacing / 2.0).ceil() as i32 + 1
+}
 
 static HOVER_INDEX: AtomicIsize = AtomicIsize::new(-1);
 
@@ -31,6 +65,11 @@ static MOVE_TARGET_HWND: AtomicIsize = AtomicIsize::new(0);
 /// The desktop index of the dot that was right-clicked (for the move menu).
 static MOVE_TARGET_INDEX: AtomicI32 = AtomicI32::new(-1);
 
+/// Where the virtual desktop indicator is placed (see [`IndicatorPosition`]).
+/// Stored as `AtomicU8` because the static [`Self::window_proc`] needs it
+/// during `render()` without access to the struct.
+static INDICATOR_POSITION: AtomicU8 = AtomicU8::new(0);
+
 fn get_hovered_index(x: i32) -> Option<usize> {
     unsafe {
         let mut tray_rect = RECT::default();
@@ -42,22 +81,103 @@ fn get_hovered_index(x: i32) -> Option<usize> {
             return None;
         }
 
-        let radius = height as f32 * 0.08;
-        let spacing = radius * 4.5;
-        let start_x = 10.0 + radius;
-
+        let count = winvd::get_desktop_count().unwrap_or(1) as usize;
+        let layout = dot_layout(height);
+        let half_spacing = layout.spacing / 2.0;
         let px = x as f32;
 
-        let count = winvd::get_desktop_count().unwrap_or(1) as usize;
-        let half_spacing = spacing / 2.0;
         for i in 0..count {
-            let cx = start_x + (i as f32) * spacing;
+            let cx = layout.start_x + (i as f32) * layout.spacing;
             // Switch to rectangular Hit-box (like a div block), connected continuously without gaps
             if px >= cx - half_spacing && px <= cx + half_spacing {
                 return Some(i);
             }
         }
         None
+    }
+}
+
+/// Returns `true` when the taskbar alignment is "Left" (buttons start at the left
+/// edge of the taskbar). Read from `HKCU\...\Explorer\Advanced\TaskbarAl`
+/// (0 = Left, 1 = Center). Defaults to `false` (Center) when the value is absent.
+fn taskbar_alignment_left() -> bool {
+    let mut value: u32 = 1;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let res = unsafe {
+        windows::Win32::System::Registry::RegGetValueW(
+            windows::Win32::System::Registry::HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced"),
+            w!("TaskbarAl"),
+            windows::Win32::System::Registry::RRF_RT_REG_DWORD,
+            None,
+            Some(&mut value as *mut _ as *mut _),
+            Some(&mut size),
+        )
+    };
+    res.is_ok() && value == 0
+}
+
+/// Left edge (screen coords) of the primary taskbar's system tray
+/// (`TrayNotifyWnd`, which contains the notification icons and the clock).
+fn tray_notify_left() -> Option<i32> {
+    unsafe {
+        let tray = FindWindowW(w!("Shell_TrayWnd"), None).ok()?;
+        let notify = FindWindowExW(Some(tray), None, w!("TrayNotifyWnd"), None).ok()?;
+        if notify.is_invalid() {
+            return None;
+        }
+        let mut rect = RECT::default();
+        GetWindowRect(notify, &mut rect).ok()?;
+        Some(rect.left)
+    }
+}
+
+/// Placement of the virtual desktop indicator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndicatorPosition {
+    /// Alignment-aware: left edge (Center-aligned taskbar) or just left of the
+    /// system tray (Left-aligned taskbar).
+    Auto = 0,
+    /// Fixed at the left edge of the taskbar.
+    Left = 1,
+    /// Fixed just left of the system tray (right side).
+    Right = 2,
+}
+
+impl IndicatorPosition {
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Left,
+            2 => Self::Right,
+            _ => Self::Auto,
+        }
+    }
+
+    pub fn to_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Computes the screen X where the indicator should sit, according to the
+/// configured [`IndicatorPosition`].
+fn indicator_left(taskbar: RECT, width: i32) -> i32 {
+    let position = IndicatorPosition::from_u8(INDICATOR_POSITION.load(Ordering::Relaxed));
+    let tray_left = tray_notify_left();
+    let left_of_tray = match tray_left {
+        Some(l) => (l - INDICATOR_MARGIN - width).max(taskbar.left),
+        None => taskbar.right - INDICATOR_MARGIN - width,
+    };
+
+    match position {
+        IndicatorPosition::Left => taskbar.left + 10,
+        IndicatorPosition::Right => left_of_tray,
+        IndicatorPosition::Auto => {
+            if taskbar_alignment_left() {
+                left_of_tray
+            } else {
+                taskbar.left + 10
+            }
+        }
     }
 }
 
@@ -259,7 +379,8 @@ impl IndicatorWindow {
     /// uses "Cloaking" technique to hide all Owned windows of the Taskbar. As a result,
     /// the Indicator will disappear while Task View is open, and usually only reappears when the Taskbar receives
     /// focus. This is a current technical limitation with no complete workaround yet.
-    pub unsafe fn new() -> anyhow::Result<Self> {
+    pub unsafe fn new(position: IndicatorPosition) -> anyhow::Result<Self> {
+        INDICATOR_POSITION.store(position.to_u8(), Ordering::Relaxed);
         let hinstance = GetModuleHandleW(None)?;
         let class_name = w!("TaskbarSwitcherIndicator");
 
@@ -276,15 +397,17 @@ impl IndicatorWindow {
         let mut tray_rect = RECT::default();
         let _ = GetWindowRect(taskbar_hwnd, &mut tray_rect);
         let taskbar_height = tray_rect.bottom - tray_rect.top;
+        let count = winvd::get_desktop_count().unwrap_or(1) as usize;
+        let width = indicator_width(taskbar_height, count);
 
         let hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class_name,
             w!("Indicator"),
             WS_POPUP | WS_VISIBLE,
-            tray_rect.left + 10,
+            indicator_left(tray_rect, width),
             tray_rect.top,
-            128,
+            width,
             taskbar_height,
             Some(taskbar_hwnd),
             None,
@@ -301,6 +424,18 @@ impl IndicatorWindow {
         Self::render(hwnd);
 
         Ok(this)
+    }
+
+    /// Changes the placement preset and re-renders the indicator.
+    pub fn set_position(&mut self, position: IndicatorPosition) {
+        INDICATOR_POSITION.store(position.to_u8(), Ordering::Relaxed);
+        Self::render(self.hwnd);
+    }
+
+    /// Re-renders the indicator, recomputing its position against the current
+    /// taskbar / system tray bounds.
+    pub fn refresh(&self) {
+        Self::render(self.hwnd);
     }
 
     /// Starts a thread to monitor Desktop switching events (Virtual Desktop).
@@ -346,12 +481,14 @@ impl IndicatorWindow {
             if let Ok(taskbar_hwnd) = FindWindowW(w!("Shell_TrayWnd"), None) {
                 let _ = GetWindowRect(taskbar_hwnd, &mut tray_rect);
             }
-            let width = 128;
             let height = tray_rect.bottom - tray_rect.top;
-
             if height <= 0 {
                 return;
             }
+
+            let count = winvd::get_desktop_count().unwrap_or(1) as usize;
+            let layout = dot_layout(height);
+            let width = indicator_width(height, count);
 
             let bmi = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
@@ -390,14 +527,10 @@ impl IndicatorWindow {
                     false => (100, 100, 100),
                 };
 
-                // Taskbar at 1080p is usually 48px high, at 4K (200%) it's 96px high.
-                // Binding to Taskbar height keeps the aspect ratio 100% accurate on all screens.
-                let radius = height as f32 * 0.07; // Radius = 7% height (equivalent to ~3.36px at 1080p)
-                let spacing = radius * 5.;
-                let start_x = 10.0 + radius;
+                let radius = layout.radius;
+                let spacing = layout.spacing;
+                let start_x = layout.start_x;
                 let cy = height as f32 / 2.0;
-
-                let count = winvd::get_desktop_count().unwrap_or(1) as usize;
                 let current = winvd::get_current_desktop().ok();
                 let desktops = winvd::get_desktops().unwrap_or_default();
                 let mut current_idx = 0;
@@ -467,7 +600,7 @@ impl IndicatorWindow {
                     cy: height,
                 };
                 let mut pt_dst = POINT {
-                    x: tray_rect.left + 10,
+                    x: indicator_left(tray_rect, width),
                     y: tray_rect.top,
                 };
                 let mut blend = BLENDFUNCTION {

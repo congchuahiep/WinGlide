@@ -24,7 +24,7 @@ use crate::logging::console::{self, CONSOLE_VISIBLE};
 use crate::setting;
 use crate::taskbar::{CycleDirection, TaskbarEnumerator, UncombineManager};
 use crate::tray_icon::{TrayIcon, IDM_EXIT, IDM_SETTINGS, IDM_SHOW_CONSOLE};
-use crate::virtual_desktop::indicator::IndicatorWindow;
+use crate::virtual_desktop::indicator::{IndicatorPosition, IndicatorWindow};
 use crate::win32::window_context::WindowContext;
 
 /// Dynamic Windows message identifier "TaskbarCreated".
@@ -123,17 +123,22 @@ impl App {
         let mut tray_icon = TrayIcon::create();
         let hidden_window = Self::create_hidden_window()?;
 
-        let indicator_window = if config.desktop_indicator {
-            unsafe { Some(IndicatorWindow::new()?) }
-        } else {
-            None
-        };
-
         unsafe {
             WM_TASKBARCREATED = RegisterWindowMessageW(w!("TaskbarCreated"));
         }
 
         tray_icon.register(hidden_window.hwnd)?;
+
+        let indicator_window = if config.desktop_indicator {
+            unsafe {
+                Some(IndicatorWindow::new(IndicatorPosition::from_u8(
+                    config.indicator_position,
+                ))?)
+            }
+        } else {
+            None
+        };
+
         let uncombine_enabled = AtomicBool::new(config.uncombine_mode);
 
         Ok(Self {
@@ -298,6 +303,11 @@ impl App {
                 if let Err(e) = self.tray_icon.reregister() {
                     error!("TrayIcon reregister: {e}");
                 }
+                // The tray re-grew after our icon was re-added; re-sync the
+                // indicator so it stays clear of the tray.
+                if let Some(ind) = &self.indicator_window {
+                    ind.refresh();
+                }
                 Some(LRESULT(0))
             }
 
@@ -406,17 +416,21 @@ impl App {
             error!("Failed to reload hotkeys: {}", e);
         }
 
-        if config.desktop_indicator && self.indicator_window.is_none() {
-            unsafe {
-                match IndicatorWindow::new() {
-                    Ok(mut ind) => {
-                        ind.run();
-                        self.indicator_window = Some(ind);
+        let position = IndicatorPosition::from_u8(config.indicator_position);
+        if config.desktop_indicator {
+            match &mut self.indicator_window {
+                Some(ind) => ind.set_position(position),
+                None => unsafe {
+                    match IndicatorWindow::new(position) {
+                        Ok(mut ind) => {
+                            ind.run();
+                            self.indicator_window = Some(ind);
+                        }
+                        Err(e) => error!("Failed to create IndicatorWindow: {}", e),
                     }
-                    Err(e) => error!("Failed to create IndicatorWindow: {}", e),
-                }
+                },
             }
-        } else if !config.desktop_indicator && self.indicator_window.is_some() {
+        } else {
             self.indicator_window = None;
         }
 
