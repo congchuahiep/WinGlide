@@ -63,7 +63,7 @@ event/
 ├── uia.rs                  -> UIA StructureChanged hook -> WM_APP_INVALIDATE_CACHE (0x101)
 └── winevent.rs             -> WinEvent EVENT_OBJECT_SHOW hook -> WM_APP_UNCOMBINE (0x100)
 virtual_desktop/
-└── indicator.rs            -> IndicatorWindow: layered window drawing desktop dots on the taskbar (winvd); click = switch desktop, Alt+click = move foreground window there
+└── indicator.rs            -> IndicatorWindow: layered window drawing desktop dots on the taskbar (winvd); left-click = switch desktop, right-click = "Move to Desktop" context menu, Alt+click = move foreground window there; placement (Auto/Left/Right) is user-configurable via Settings
 tray_icon.rs                -> Shell_NotifyIconW tray icon + context menu (Exit / Settings / Debug Console)
 setting/                    -> windows-reactor native GUI settings (hotkey capture, toggles, update check)
 logging/                    -> tracing-subscriber: rolling file + detached console via named pipes; tracing-forest format
@@ -82,6 +82,7 @@ utils.rs                    -> clean_button_name, truncate, is_system_class, is_
 - `cycle_taskbar_based: bool` (default true)
 - `hotkey_left_vk` / `hotkey_left_modifiers`, `hotkey_right_vk` / `hotkey_right_modifiers` (default Alt+`[` / Alt+`]`)
 - `desktop_indicator: bool` (default true)
+- `indicator_position: u8` (0=Auto, 1=Left, 2=Right; serde default 0 so old configs keep parsing)
 - `jump_desktop_modifiers: u32` (default Alt)
 
 **Invariant:** in `load()`, if `cycle_taskbar_based` is true then `uncombine_mode` is forced to true.
@@ -158,5 +159,6 @@ Button-to-window matching tries 4 strategies in order:
 
 - `switch_desktop` + `WindowContext::current_state()` are used to re-activate a window on the target desktop after switching (`App::handle_hotkey` -> `SwitchVirtualDesktop`).
 - `IndicatorWindow` is an owned layered window of `Shell_TrayWnd`; it gets cloaked by DWM when Task View (`Win+Tab`) opens - known limitation.
-- **Move window to desktop via indicator**: with `Alt` held, clicking a desktop dot moves the foreground window to that desktop (via `winvd::move_window_to_desktop`), switches there, and re-activates it (`force_activate`). Requires the `transmute` of the HWND into winvd's `windows`-0.58 type. Pinned (all-desktops) windows are ignored.
+- **Move window to desktop via indicator**: right-clicking a desktop dot opens a menu for exactly that dot's desktop N, with the window title in a disabled header and two short items: "Move to Desktop N" (move only) and "Move and jump to Desktop N" (move + switch + re-activate); the move-only item is grayed when the window is already on that desktop. The target window is captured before the menu temporarily drops `WS_EX_NOACTIVATE` (stored in `MOVE_TARGET_HWND` + `MOVE_TARGET_INDEX`); `force_activate` hands focus back to the app window after the menu closes, and the indicator's own class (`TaskbarSwitcherIndicator`) is filtered out of move targets so it can never be chosen as the window to move. `Alt`+click a dot is the move+jump keyboard shortcut. Requires the `transmute` of the HWND into winvd's `windows`-0.58 type. Pinned (all-desktops) windows are ignored.
+- **Indicator placement** (`AppConfig.indicator_position`: 0 Auto / 1 Left / 2 Right): in **Auto** the indicator stays clear of the system tray when the taskbar is Left-aligned (`HKCU\\...\\Explorer\\Advanced\\TaskbarAl` = 0) by anchoring just left of `TrayNotifyWnd`, otherwise it sits at the left edge. **Left**/**Right** pin it to a fixed side (Right anchors just left of the tray). Changed from the Settings GUI (Desktop Indicator -> Position), applied on `WM_APP_RELOAD_CONFIG` via `IndicatorWindow::set_position`. Position is decided at render time (no polling).
 - Hotkey auto-repeat protection
