@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    paths:
+      - Cargo.toml
   workflow_dispatch:
 
 jobs:
@@ -35,11 +37,12 @@ jobs:
         run: |
           $tag = "v${{ steps.version.outputs.version }}"
           $hasTag = [bool](git tag --list $tag)
-          Write-Output "skip=$($hasTag.ToString().ToLower())" >> $env:GITHUB_OUTPUT
           if ($hasTag) {
-            Write-Output "::notice::Tag $tag already exists - skipping release"
+            Write-Output "skip=true" >> $env:GITHUB_OUTPUT
+            Write-Output "::warning::Version chua thay doi: tag $tag da ton tai, khong tao release moi. Hay bump version trong Cargo.toml neu muon release."
           } else {
-            Write-Output "::notice::Tag $tag not found - building and releasing"
+            Write-Output "skip=false" >> $env:GITHUB_OUTPUT
+            Write-Output "::notice::Tag $tag chua ton tai - se build va tao release moi"
           }
 
   build:
