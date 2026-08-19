@@ -65,7 +65,7 @@ jobs:
         uses: cargo-bins/cargo-binstall@main
 
       - name: Install cargo-wix
-        run: cargo binstall cargo-wix -y || cargo install cargo-wix --locked
+        run: cargo binstall cargo-wix -y --force || cargo install cargo-wix --locked
 
       - name: Build project
         run: cargo build --release
