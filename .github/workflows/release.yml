@@ -2,11 +2,49 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
+  workflow_dispatch:
 
 jobs:
+  # Đọc version từ Cargo.toml và kiểm tra tag tương ứng đã tồn tại chưa
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      skip: ${{ steps.check-tag.outputs.skip }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version from Cargo.toml
+        id: version
+        shell: pwsh
+        run: |
+          $content = Get-Content Cargo.toml -Raw
+          $package = [regex]::Match($content, '(?s)\[package\].*?(?=\r?\n\[)').Value
+          $version = [regex]::Match($package, 'version\s*=\s*"([^"]+)"').Groups[1].Value
+          Write-Output "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Output "::notice::Cargo.toml version = $version"
+
+      - name: Check if tag already exists
+        id: check-tag
+        shell: pwsh
+        run: |
+          $tag = "v${{ steps.version.outputs.version }}"
+          $hasTag = [bool](git tag --list $tag)
+          Write-Output "skip=$($hasTag.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          if ($hasTag) {
+            Write-Output "::notice::Tag $tag already exists - skipping release"
+          } else {
+            Write-Output "::notice::Tag $tag not found - building and releasing"
+          }
+
   build:
+    needs: check-version
+    if: needs.check-version.outputs.skip != 'true'
     runs-on: windows-latest
     permissions:
       contents: write
@@ -57,6 +95,8 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ needs.check-version.outputs.version }}
+          name: WinGlide v${{ needs.check-version.outputs.version }}
           files: |
             target\wix\WinGlide-x86_64.msi
             target\wix\WinGlide-Portable-x86_64.zip
