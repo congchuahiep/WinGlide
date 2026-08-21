@@ -1,3 +1,5 @@
+
+
 # WinGlide
 
 ![Windows 11 Only](https://img.shields.io/badge/OS-Windows%2011-blue?logo=windows)
@@ -60,7 +62,7 @@ WinGlide runs quietly in the background, but you can easily customize its behavi
 # Build the application
 cargo build
 
-# Build release version
+# Build release version (binary -> target/release/WinGlide.exe)
 cargo build --release
 
 # Run normally
