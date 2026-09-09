@@ -44,8 +44,11 @@ main.rs                     -> panic hook -> dispatch: cli::parse_args -> bootst
 cli.rs                      -> manual arg parsing (RunMode: ConsoleWorker / SettingsUi / BackgroundApp)
 config.rs                   -> AppConfig: serde JSON at %APPDATA%/WinGlide/config.json (see "Config")
 bootstrap.rs                -> ensure_single_instance (named mutex), attach_debug_console, setup_dpi_awareness
-app.rs                      -> orchestrator: wires hotkey_manager + enumerator + uncombine_manager + tray + indicator + hidden window
-hotkey.rs                   -> RegisterHotKey; dispatches HotkeyAction::CycleLeft/CycleRight/SwitchVirtualDesktop(idx)
+app.rs                      -> orchestrator: wires hotkey_manager + key_hook + enumerator + uncombine_manager + tray + indicator + hidden window
+hotkey/
+├── mod.rs                  -> module doc + re-export: HotkeyManager, HotkeyAction, LowLevelKeyHook
+├── manager.rs              -> HotkeyManager: RegisterHotKey + dispatch classification; HotkeyAction::CycleLeft/CycleRight/SwitchVirtualDesktop(idx)
+└── low_level_hook.rs       -> generic WH_KEYBOARD_LL hook: overrides Windows-owned combos (any Win+key); posts WM_HOTKEY with the same IDs
 taskbar/
 ├── mod.rs                  -> module doc + re-export: TaskbarEnumerator, CycleDirection, UncombineManager
 ├── enumerator.rs           -> IUIAutomation: enumerate buttons, 1s TTL cache, cycle_to_neighbor
@@ -136,6 +139,13 @@ Button-to-window matching tries 4 strategies in order:
 - ID 1 = Left cycle, ID 2 = Right cycle (both only registered when `cycle_taskbar_based` is true)
 - IDs 11..=19 = `SwitchVirtualDesktop(0..8)` (`Alt+1`..`Alt+9`), only registered when `jump_desktop_modifiers != 0`
 - All configurable via Settings GUI; `HotkeyManager::reload()` re-registers on `WM_APP_RELOAD_CONFIG`
+
+### Low-level hotkey dispatch (hotkey/low_level_hook.rs)
+
+- `HotkeyManager` classifies every hotkey via `dispatch_for(modifiers)`: any combo **involving Win** gets `HotkeyDispatch::LowLevelHook`, everything else stays on `RegisterHotKey` (which cannot claim `Win+1..Win+9` because they are Windows-native taskbar shortcuts, nor reserved combos like `Win+L`).
+- `HotkeyManager::low_level_hotkeys()` hands the Win combos to `LowLevelKeyHook::set_hotkeys()` (called from `App::new` and `handle_reload_config`, both on the main message-loop thread).
+- The generic `WH_KEYBOARD_LL` proc matches `(modifiers, vk)` with exact modifier semantics (mirrors `RegisterHotKey`), swallows the key (`LRESULT(1)`) so the native Windows behavior never fires, and posts `WM_HOTKEY` with the same hotkey ID, so `App::handle_hotkey` / `action_from_id` work unchanged for both mechanisms (including auto-repeat drain).
+- Hook state is a `thread_local` (the hook proc only runs on the installing thread); add a future low-level hotkey by assigning it `LowLevelHook` in `dispatch_for`/registration - no other wiring needed.
 
 ### Custom window messages
 

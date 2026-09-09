@@ -1,14 +1,41 @@
-//! Global hotkeys management using the Win32 API.
-//!
-//! This module is responsible for registering, unregistering, and mapping global hotkeys.
+//! Hotkey manager: owns the hotkey set, classifies each hotkey's delivery mechanism,
+//! and maps hotkey IDs to actions.
 //!
 //! By default, the application registers two hotkeys:
-//! - **Alt + [**: Move focus to the left Taskbar button ([`HotkeyAction::Left`])
-//! - **Alt + ]**: Move focus to the right Taskbar button ([`HotkeyAction::Right`])
+//! - **Alt + [**: Move focus to the left Taskbar button ([`HotkeyAction::CycleLeft`])
+//! - **Alt + ]**: Move focus to the right Taskbar button ([`HotkeyAction::CycleRight`])
+//!
+//! Hotkeys whose combination involves the **Win** modifier cannot be claimed with
+//! `RegisterHotKey` (Windows owns `Win+<number>` taskbar shortcuts and reserved combos
+//! like `Win+L`), so they are dispatched through the low-level keyboard hook instead
+//! (see [`crate::hotkey::LowLevelKeyHook`]). Both mechanisms post `WM_HOTKEY` with the
+//! same IDs, so [`HotkeyManager::action_from_id`] works uniformly.
 
+use super::low_level_hook::LowLevelHotkey;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS,
+    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_WIN,
 };
+
+/// How a hotkey is delivered to the application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotkeyDispatch {
+    /// Registered with `RegisterHotKey`; Windows posts `WM_HOTKEY` when pressed.
+    Registered,
+    /// Intercepted by the low-level keyboard hook; we post `WM_HOTKEY` ourselves.
+    LowLevelHook,
+}
+
+/// Chooses the dispatch mechanism for a hotkey. Any combination involving the Win
+/// modifier is routed through the low-level hook, because such combinations are often
+/// owned by Windows (native taskbar shortcuts, reserved combos) and would fail to
+/// register — and because the hook also suppresses the native behavior.
+fn dispatch_for(modifiers: u32) -> HotkeyDispatch {
+    if modifiers & MOD_WIN.0 != 0 {
+        HotkeyDispatch::LowLevelHook
+    } else {
+        HotkeyDispatch::Registered
+    }
+}
 
 /// Actions that can be triggered by global hotkeys.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -31,6 +58,8 @@ struct Hotkey {
     modifiers: HOT_KEY_MODIFIERS,
     /// Virtual Key Code of the main key.
     vk: u32,
+    /// How this hotkey is delivered to the application.
+    dispatch: HotkeyDispatch,
 }
 
 impl Hotkey {
@@ -39,11 +68,17 @@ impl Hotkey {
     /// # Errors
     /// Returns an error if the hotkey is already in use by another application.
     fn register(&self) -> windows::core::Result<()> {
+        if self.dispatch != HotkeyDispatch::Registered {
+            return Ok(());
+        }
         unsafe { RegisterHotKey(None, self.id, self.modifiers, self.vk) }
     }
 
     /// Unregisters this hotkey from the Windows system.
     fn unregister(&self) {
+        if self.dispatch != HotkeyDispatch::Registered {
+            return;
+        }
         unsafe {
             let _ = UnregisterHotKey(None, self.id);
         }
@@ -60,8 +95,8 @@ impl HotkeyManager {
     /// Initializes the manager and registers the default hotkeys with the system.
     ///
     /// Defaults:
-    /// - ID 1: `Alt+[` -> Cycle left ([`HotkeyAction::Left`]).
-    /// - ID 2: `Alt+]` -> Cycle right ([`HotkeyAction::Right`]).
+    /// - ID 1: `Alt+[` -> Cycle left ([`HotkeyAction::CycleLeft`]).
+    /// - ID 2: `Alt+]` -> Cycle right ([`HotkeyAction::CycleRight`]).
     /// - ID 11-19: `Alt+1` -> `Alt+9` -> Switch to respective VD ([`HotkeyAction::SwitchVirtualDesktop`]).
     ///
     /// TODO: Allow users to customize hotkeys.
@@ -78,16 +113,22 @@ impl HotkeyManager {
                 action: HotkeyAction::CycleLeft,
                 modifiers: HOT_KEY_MODIFIERS(config.hotkey_left_modifiers),
                 vk: config.hotkey_left_vk,
+                dispatch: dispatch_for(config.hotkey_left_modifiers),
             });
             hotkeys.push(Hotkey {
                 id: 2,
                 action: HotkeyAction::CycleRight,
                 modifiers: HOT_KEY_MODIFIERS(config.hotkey_right_modifiers),
                 vk: config.hotkey_right_vk,
+                dispatch: dispatch_for(config.hotkey_right_modifiers),
             });
         }
 
-        // Register Switch Desktop hotkeys if at least 1 modifier key is set
+        // Jump-to-desktop keys. When the Win modifier is involved, `Win+1..Win+9`
+        // are owned by Windows (native taskbar shortcuts) and cannot be registered
+        // with RegisterHotKey; the low-level keyboard hook overrides them instead.
+        // The entries are always kept so action_from_id maps the IDs the hook posts.
+        let dispatch = dispatch_for(config.jump_desktop_modifiers);
         if config.jump_desktop_modifiers != 0 {
             for i in 1..=9 {
                 hotkeys.push(Hotkey {
@@ -95,6 +136,7 @@ impl HotkeyManager {
                     action: HotkeyAction::SwitchVirtualDesktop(i as u32 - 1),
                     modifiers: HOT_KEY_MODIFIERS(config.jump_desktop_modifiers),
                     vk: 0x30 + i as u32,
+                    dispatch,
                 });
             }
         }
@@ -124,6 +166,20 @@ impl HotkeyManager {
         }
     }
 
+    /// Returns the hotkeys that must be intercepted by the low-level keyboard hook
+    /// (Win-involved combinations that `RegisterHotKey` cannot claim).
+    pub fn low_level_hotkeys(&self) -> Vec<LowLevelHotkey> {
+        self.hotkeys
+            .iter()
+            .filter(|h| h.dispatch == HotkeyDispatch::LowLevelHook)
+            .map(|h| LowLevelHotkey {
+                id: h.id,
+                modifiers: h.modifiers.0,
+                vk: h.vk,
+            })
+            .collect()
+    }
+
     /// Looks up the action corresponding to the hotkey ID received from the system message.
     pub fn action_from_id(&self, id: i32) -> Option<HotkeyAction> {
         self.hotkeys.iter().find(|h| h.id == id).map(|h| h.action)
@@ -143,6 +199,7 @@ impl HotkeyManager {
                 action: HotkeyAction::CycleLeft,
                 modifiers: HOT_KEY_MODIFIERS(config.hotkey_left_modifiers),
                 vk: config.hotkey_left_vk,
+                dispatch: dispatch_for(config.hotkey_left_modifiers),
             });
 
             self.hotkeys.push(Hotkey {
@@ -150,9 +207,11 @@ impl HotkeyManager {
                 action: HotkeyAction::CycleRight,
                 modifiers: HOT_KEY_MODIFIERS(config.hotkey_right_modifiers),
                 vk: config.hotkey_right_vk,
+                dispatch: dispatch_for(config.hotkey_right_modifiers),
             });
         }
 
+        let dispatch = dispatch_for(config.jump_desktop_modifiers);
         if config.jump_desktop_modifiers != 0 {
             for i in 1..=9 {
                 self.hotkeys.push(Hotkey {
@@ -160,6 +219,7 @@ impl HotkeyManager {
                     action: HotkeyAction::SwitchVirtualDesktop(i as u32 - 1),
                     modifiers: HOT_KEY_MODIFIERS(config.jump_desktop_modifiers),
                     vk: 0x30 + i as u32,
+                    dispatch,
                 });
             }
         }

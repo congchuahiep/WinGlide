@@ -2,3 +2,6 @@
 /logs
 /dist
 dist/
+/docs
+
+windhawk_mod.cpp

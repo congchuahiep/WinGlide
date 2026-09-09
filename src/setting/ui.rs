@@ -235,6 +235,7 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
     // Initialize flags for toggle buttons
     let has_ctrl = config.jump_desktop_modifiers & MOD_CONTROL.0 != 0;
     let has_alt = config.jump_desktop_modifiers & MOD_ALT.0 != 0;
+    let has_win = config.jump_desktop_modifiers & MOD_WIN.0 != 0;
 
     let update_modifier = {
         let set_config = set_config.clone();
@@ -261,9 +262,13 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
         let update_modifier = update_modifier.clone();
         move |checked| update_modifier(MOD_ALT.0, checked)
     });
+    let win_btn = toggle_button("Win", has_win).on_changed({
+        let update_modifier = update_modifier.clone();
+        move |checked| update_modifier(MOD_WIN.0, checked)
+    });
 
-    let jump_modifiers_action = hstack((ctrl_btn, alt_btn))
-        .spacing(4.0)
+    let jump_modifiers_action = hstack((ctrl_btn, alt_btn, win_btn))
+        .spacing(2.0)
         .margin(Thickness {
             right: 10.,
             ..Default::default()
@@ -536,9 +541,9 @@ pub fn run() -> Result<()> {
     App::new()
         .title("WinGlide")
         .backdrop(Backdrop::Mica)
-        .inner_size(500., 720.)
+        .inner_size(540., 720.)
         .inner_constraints(InnerConstraints {
-            min_width: Some(500.),
+            min_width: Some(540.),
             min_height: Some(540.),
             max_width: None,
             max_height: None,
