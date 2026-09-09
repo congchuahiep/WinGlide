@@ -19,7 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::config::AppConfig;
 use crate::event::{self, InvalidateSource};
-use crate::hotkey::{HotkeyAction, HotkeyManager};
+use crate::hotkey::{HotkeyAction, HotkeyManager, LowLevelKeyHook};
 use crate::logging::console::{self, CONSOLE_VISIBLE};
 use crate::setting;
 use crate::taskbar::{CycleDirection, TaskbarEnumerator, UncombineManager};
@@ -87,6 +87,10 @@ pub struct App {
     /// Manager for registering and unregistering global hotkeys (Alt+[` / Alt+`]).
     hotkey_manager: HotkeyManager,
 
+    /// Low-level keyboard hook overriding Windows-native hotkey combinations that
+    /// `RegisterHotKey` cannot claim (e.g. `Win+<number>` taskbar shortcuts).
+    key_hook: LowLevelKeyHook,
+
     /// Manager for configuring combining/uncombining of Taskbar windows.
     /// Statically leaked (`&'static`) for thread-safe sharing between threads/WinEvent callbacks.
     uncombine_manager: Box<UncombineManager>,
@@ -119,6 +123,8 @@ impl App {
     pub fn new(config: &AppConfig) -> anyhow::Result<Self> {
         let enumerator = TaskbarEnumerator::new()?;
         let hotkey_manager = HotkeyManager::new(config)?;
+        let key_hook = LowLevelKeyHook::new();
+        key_hook.set_hotkeys(&hotkey_manager.low_level_hotkeys());
         let uncombine_manager = Box::new(UncombineManager::new());
         let mut tray_icon = TrayIcon::create();
         let hidden_window = Self::create_hidden_window()?;
@@ -144,6 +150,7 @@ impl App {
         Ok(Self {
             enumerator,
             hotkey_manager,
+            key_hook,
             uncombine_manager,
             uncombine_enabled,
             running: Arc::new(AtomicBool::new(true)),
@@ -415,6 +422,9 @@ impl App {
         if let Err(e) = self.hotkey_manager.reload(&config) {
             error!("Failed to reload hotkeys: {}", e);
         }
+
+        self.key_hook
+            .set_hotkeys(&self.hotkey_manager.low_level_hotkeys());
 
         let position = IndicatorPosition::from_u8(config.indicator_position);
         if config.desktop_indicator {
