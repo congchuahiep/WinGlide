@@ -95,6 +95,23 @@ jobs:
         run: |
           Compress-Archive -Path dist\* -DestinationPath target\wix\WinGlide-Portable-x86_64.zip
 
+      # Stage chỉ 2 artifact cuối vào thư mục sạch (target\wix còn chứa file trung gian .wixobj/.wixpdb)
+      - name: Stage artifacts for GitHub Pages
+        run: |
+          New-Item -ItemType Directory -Path pages -Force
+          Copy-Item target\wix\WinGlide-x86_64.msi pages\
+          Copy-Item target\wix\WinGlide-Portable-x86_64.zip pages\
+
+      # Push lên branch gh-pages để GitHub Pages phục vụ trực tiếp (không redirect)
+      - name: Publish to GitHub Pages (gh-pages branch)
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: ./pages
+          force_orphan: true
+          enable_jekyll: false
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
