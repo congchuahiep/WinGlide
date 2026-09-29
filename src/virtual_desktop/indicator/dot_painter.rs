@@ -11,22 +11,15 @@ use super::indicator_geometry::{
 use super::utils::count as get_desktop_count;
 use crate::shared::system_theme::{accent_color, is_light_theme};
 
-/// Neutral dot color on a light taskbar (used when the accent color is off or
-/// can't be read).
 const DOTS_ON_LIGHT_THEME: (u8, u8, u8) = (20, 20, 20);
-/// Neutral dot color on a dark taskbar (used when the accent color is off or
-/// can't be read).
-const DOTS_ON_DARK_THEME: (u8, u8, u8) = (255, 255, 255);
-/// How far an inactive dot is pulled toward gray, so an accent-colored row still
-/// reads as "this one is current, the rest are idle".
+const DOTS_ON_DARK_THEME: (u8, u8, u8) = (235, 235, 235);
+
 const INACTIVE_DESATURATION: f32 = 0.6;
-/// How much the active dot's accent is deepened (channels scaled) so it stands
-/// out even further against the desaturated inactive dots.
-const ACTIVE_DEEPEN: f32 = 0.7;
-/// Alpha of the translucent background drawn behind the dot row. Kept below the
-/// hover highlight's 0.3 so hovering still reads as a highlight.
+
+const LIGHT_ACCENT_CONTRAST_BLEND: f32 = 0.3;
+const DARK_ACCENT_CONTRAST_BLEND: f32 = 0.4;
+
 const BACKGROUND_ALPHA: f32 = 0.25;
-/// Corner radius (px) of the rounded highlights / background.
 const CORNER_RADIUS: f32 = 6.0;
 
 /// Draws a full set of desktop dots for one indicator frame.
@@ -60,7 +53,7 @@ impl DotPainter {
             DOTS_ON_DARK_THEME
         };
         let active_color = if accent {
-            accent_color().map_or(theme_dots, |rgb| deepen(rgb, ACTIVE_DEEPEN))
+            accent_color().map_or(theme_dots, |rgb| blend_for_theme(rgb, light_mode))
         } else {
             theme_dots
         };
@@ -284,19 +277,38 @@ fn write_pixel(canvas: &mut Canvas<'_>, x: i32, y: i32, color: (u8, u8, u8), alp
 /// 1 = fully gray), muting accent dots that are not active.
 fn desaturate(color: (u8, u8, u8), amount: f32) -> (u8, u8, u8) {
     let (r, g, b) = color;
-    let luma = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
-    let mix = |c: u8| {
-        (c as f32 + (luma - c as f32) * amount)
+    let luma = (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32)
+        .round()
+        .clamp(0.0, 255.0) as u8;
+    mix(color, (luma, luma, luma), amount)
+}
+
+/// Mixes `color` toward the theme's contrast color: black on a light taskbar,
+/// white on a dark one, so the accent keeps contrast in both themes.
+fn blend_for_theme(color: (u8, u8, u8), light_mode: bool) -> (u8, u8, u8) {
+    let target_blend = match light_mode {
+        true => DOTS_ON_LIGHT_THEME,
+        false => DOTS_ON_DARK_THEME,
+    };
+
+    let target_constrast = match light_mode {
+        true => LIGHT_ACCENT_CONTRAST_BLEND,
+        false => DARK_ACCENT_CONTRAST_BLEND,
+    };
+
+    mix(color, target_blend, target_constrast)
+}
+
+/// Linear mix per channel: `t = 0` keeps `from`, `t = 1` gives `to`.
+fn mix(from: (u8, u8, u8), to: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
+    let blend = |a: u8, b: u8| {
+        (a as f32 + (b as f32 - a as f32) * t)
             .round()
             .clamp(0.0, 255.0) as u8
     };
-    (mix(r), mix(g), mix(b))
-}
-
-/// Scales `color`'s channels down, keeping its hue and saturation but making it
-/// deeper/darker.
-fn deepen(color: (u8, u8, u8), factor: f32) -> (u8, u8, u8) {
-    let (r, g, b) = color;
-    let scale = |c: u8| (c as f32 * factor).round().clamp(0.0, 255.0) as u8;
-    (scale(r), scale(g), scale(b))
+    (
+        blend(from.0, to.0),
+        blend(from.1, to.1),
+        blend(from.2, to.2),
+    )
 }
