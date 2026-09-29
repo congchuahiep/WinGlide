@@ -1,10 +1,6 @@
 //! Finds windows and reads window properties (AppUserModelID, process name).
 
-use crate::{
-    win32::{aumid::get_aumid, window_context::WindowContext},
-    types::WindowInfo,
-    utils::is_system_class,
-};
+use super::{aumid::get_aumid, context::WindowContext, system_class::is_system_class, WindowInfo};
 use std::{collections::HashMap, sync::Mutex};
 use tracing::{debug, instrument};
 use windows::Win32::{

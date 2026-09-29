@@ -16,9 +16,9 @@
 //! 3. App exit (Ctrl+C) -> restore_all() restores original AUMID
 //! ```
 
-use crate::win32::window::find_visible_windows;
-use crate::win32::aumid::{get_aumid, set_aumid};
-use crate::utils::truncate;
+use crate::shared::text::truncate;
+use crate::window::aumid::{get_aumid, set_aumid};
+use crate::window::enumerate::find_visible_windows;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use tracing::{debug, error, instrument};

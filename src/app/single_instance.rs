@@ -1,17 +1,16 @@
-//! Handles application bootstrap routines.
+//! Single-instance enforcement via named mutexes.
 //!
-//! This module includes functions responsible for initial application setup such as
-//! enforcing single-instance restrictions via Mutex, attaching debug consoles,
-//! and setting up DPI awareness for modern Windows displays.
+//! Two independent mutexes exist because the background engine and the Settings
+//! UI are separate processes that may each run at most once. When a second
+//! instance starts, it instead signals the running one to come to the front.
 
-use std::sync::atomic::Ordering;
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, LPARAM, WPARAM};
-use windows::Win32::System::Console::{AllocConsole, AttachConsole, ATTACH_PARENT_PROCESS};
 use windows::Win32::System::Threading::CreateMutexW;
-use windows::Win32::UI::HiDpi;
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, PostMessageW, SetForegroundWindow, ShowWindow, SW_RESTORE, WM_COMMAND,
 };
+
+use crate::tray::IDM_SETTINGS;
 
 /// Specifies the type of application instance to check for uniqueness.
 pub enum InstanceType {
@@ -56,7 +55,7 @@ pub fn ensure_single_instance(instance_type: InstanceType) -> bool {
                             let _ = PostMessageW(
                                 Some(hwnd),
                                 WM_COMMAND,
-                                WPARAM(crate::tray_icon::IDM_SETTINGS as usize),
+                                WPARAM(IDM_SETTINGS as usize),
                                 LPARAM(0),
                             );
                         }
@@ -66,30 +65,5 @@ pub fn ensure_single_instance(instance_type: InstanceType) -> bool {
             }
         }
         true
-    }
-}
-
-/// Attaches a console to the current GUI application.
-///
-/// Windows GUI subsystem applications do not have a console by default.
-/// This function attempts to attach to the parent's console, and if that fails,
-/// allocates a new console window. Useful for debugging and CLI usage.
-pub fn attach_debug_console() {
-    unsafe {
-        if AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
-            let _ = AllocConsole();
-        }
-    }
-    crate::logging::console::DEBUG_CLI_MODE.store(true, Ordering::SeqCst);
-}
-
-/// Configures the process to be Per-Monitor DPI Aware V2.
-///
-/// This ensures the application scales correctly on modern high-DPI displays
-/// and dynamically responds to DPI changes without blurring.
-pub fn setup_dpi_awareness() {
-    unsafe {
-        let _ =
-            HiDpi::SetProcessDpiAwarenessContext(HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 }

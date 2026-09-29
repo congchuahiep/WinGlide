@@ -45,13 +45,13 @@ use windows::Win32::UI::Shell::VirtualDesktopManager;
 use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, FindWindowW, GetForegroundWindow};
 
 use super::button_window::ButtonWindowMap;
+use super::explorer_process::invalidate_explorer_pid_cache;
+use super::{TargetWindow, TaskbarButton};
 use crate::event::UiaEventHook;
-use crate::types::{TargetWindow, TaskbarButton};
-use crate::utils::truncate;
-use crate::win32::activate::force_activate;
-use crate::win32::explorer::invalidate_explorer_pid_cache;
-use crate::win32::window::find_visible_windows;
-use crate::win32::window_context::WindowContext;
+use crate::shared::text::truncate;
+use crate::window::activate::force_activate;
+use crate::window::context::WindowContext;
+use crate::window::enumerate::find_visible_windows;
 
 /// Cache TTL: 1 second. If no WinEvent invalidates it, the cache auto-expires after 1s.
 const CACHE_TTL_SECS: f64 = 1.0;

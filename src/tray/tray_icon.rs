@@ -11,10 +11,10 @@ use windows::Win32::Foundation::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::utils::is_light_theme;
+use crate::shared::system_theme::is_light_theme;
 
-const ICON_LIGHT_BYTES: &[u8] = include_bytes!("../assets/icon-light.ico");
-const ICON_DARK_BYTES: &[u8] = include_bytes!("../assets/icon-dark.ico");
+const ICON_LIGHT_BYTES: &[u8] = include_bytes!("../../assets/icon-light.ico");
+const ICON_DARK_BYTES: &[u8] = include_bytes!("../../assets/icon-dark.ico");
 
 pub const IDM_EXIT: u32 = 1;
 pub const IDM_SHOW_CONSOLE: u32 = 3;

@@ -1,3 +1,6 @@
+//! Builds the `tracing_subscriber` stack: a JSON rolling file plus the
+//! forest-formatted detached console.
+
 use tracing::level_filters::LevelFilter;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_forest::{ForestLayer, Printer, Tag};
