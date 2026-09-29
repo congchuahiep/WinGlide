@@ -7,7 +7,11 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse;
+use windows::Win32::UI::Shell::{
+    SHAppBarMessage, ABE_LEFT, ABE_RIGHT, ABE_TOP, ABM_GETTASKBARPOS, APPBARDATA,
+};
 use windows::Win32::UI::WindowsAndMessaging::{self, *};
 
 use crate::utils;
@@ -20,6 +24,223 @@ const INDICATOR_MARGIN: i32 = 6;
 /// Command-ID base for the "Move to Desktop" context menu items.
 const MENU_MOVE_BASE: usize = 1000;
 
+/// Which screen edge the primary taskbar occupies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskbarEdge {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+impl TaskbarEdge {
+    /// `true` for a left/right (vertical) taskbar, `false` for top/bottom.
+    fn is_vertical(self) -> bool {
+        matches!(self, TaskbarEdge::Left | TaskbarEdge::Right)
+    }
+}
+
+/// Detects the screen edge of the primary taskbar.
+///
+/// Prefers the documented appbar API `SHAppBarMessage(ABM_GETTASKBARPOS)` and
+/// falls back to measuring the `Shell_TrayWnd` rectangle when that query fails
+/// (e.g. right after an Explorer restart). A vertical taskbar is tall and
+/// narrow, so `width < height` is a reliable fallback signal.
+fn primary_taskbar_edge(taskbar_rect: RECT) -> TaskbarEdge {
+    unsafe {
+        let mut abd = APPBARDATA {
+            cbSize: std::mem::size_of::<APPBARDATA>() as u32,
+            ..Default::default()
+        };
+        if SHAppBarMessage(ABM_GETTASKBARPOS, &mut abd) != 0 {
+            return if abd.uEdge == ABE_LEFT {
+                TaskbarEdge::Left
+            } else if abd.uEdge == ABE_RIGHT {
+                TaskbarEdge::Right
+            } else if abd.uEdge == ABE_TOP {
+                TaskbarEdge::Top
+            } else {
+                // ABE_BOTTOM, or any unexpected value, means bottom.
+                TaskbarEdge::Bottom
+            };
+        }
+    }
+
+    let width = taskbar_rect.right - taskbar_rect.left;
+    let height = taskbar_rect.bottom - taskbar_rect.top;
+    if width >= height {
+        if taskbar_rect.top <= 0 {
+            TaskbarEdge::Top
+        } else {
+            TaskbarEdge::Bottom
+        }
+    } else if taskbar_rect.left <= 0 {
+        TaskbarEdge::Left
+    } else {
+        TaskbarEdge::Right
+    }
+}
+
+/// The taskbar's short dimension (across the bar): its height for a horizontal
+/// taskbar, its width for a vertical one. This is what sizes the dots.
+fn taskbar_thickness(taskbar_rect: RECT, edge: TaskbarEdge) -> i32 {
+    if edge.is_vertical() {
+        taskbar_rect.right - taskbar_rect.left
+    } else {
+        taskbar_rect.bottom - taskbar_rect.top
+    }
+}
+
+/// Standard thickness (px) of an icons-only taskbar at 96 DPI. A vertical
+/// taskbar whose width is much larger than this is showing button labels.
+const ICON_TASKBAR_THICKNESS: i32 = 48;
+
+/// DPI of the taskbar window (96 when unavailable).
+fn taskbar_dpi(taskbar_hwnd: HWND) -> u32 {
+    let dpi = unsafe { GetDpiForWindow(taskbar_hwnd) };
+    if dpi == 0 {
+        96
+    } else {
+        dpi
+    }
+}
+
+/// Thickness of an icons-only taskbar at the given DPI.
+fn icon_scale(dpi: u32) -> i32 {
+    (ICON_TASKBAR_THICKNESS * dpi as i32) / 96
+}
+
+/// Detects whether a vertical taskbar is wide enough to be showing button labels.
+/// Icons-only columns stay close to [`ICON_TASKBAR_THICKNESS`], while labels need
+/// far more width. Horizontal taskbars are never in label mode.
+fn vertical_label_mode(taskbar_hwnd: HWND, taskbar: RECT, edge: TaskbarEdge) -> bool {
+    if !edge.is_vertical() {
+        return false;
+    }
+    let icon = icon_scale(taskbar_dpi(taskbar_hwnd));
+    taskbar_thickness(taskbar, edge) > icon * 3 / 2
+}
+
+/// Largest dot scale no bigger than `preferred` for which the whole indicator
+/// still fits inside `available` px along the dots' axis.
+fn fit_scale(preferred: i32, available: i32, count: usize) -> i32 {
+    if indicator_length(preferred, count) <= available {
+        return preferred.max(1);
+    }
+    // indicator_length is affine in the scale: length ≈ 11 + k * scale.
+    let k = 0.245 + 0.35 * (count.saturating_sub(1) as f32);
+    if k <= 0.0 {
+        return 1;
+    }
+    (((available - 11) as f32 / k).floor() as i32).max(1)
+}
+
+/// Everything the indicator needs to render / place itself, resolved from the
+/// taskbar edge and (for a vertical taskbar) whether labels are shown.
+///
+/// * horizontal taskbar -> dots run along X, cross-axis is the bar's height;
+/// * vertical, icons only -> dots run along Y inside the narrow column;
+/// * vertical, with labels -> the column is wide, so the dots run along X as a
+///   short horizontal row (a vertical stack would look crude).
+#[derive(Clone, Copy)]
+struct IndicatorGeometry {
+    edge: TaskbarEdge,
+    /// Dots are stacked along the taskbar's vertical axis (icon-only vertical bar).
+    dots_vertical: bool,
+    /// Cross-axis size in px; sizes the dots and the window's short side.
+    cross: i32,
+    /// Along-axis length in px needed to fit every desktop dot.
+    length: i32,
+}
+
+impl IndicatorGeometry {
+    /// Resolves the geometry for the primary taskbar, or `None` when there is no
+    /// usable taskbar rectangle.
+    fn detect(taskbar_hwnd: HWND, taskbar: RECT) -> Option<Self> {
+        let edge = primary_taskbar_edge(taskbar);
+        let thickness = taskbar_thickness(taskbar, edge);
+        if thickness <= 0 {
+            return None;
+        }
+
+        let count = winvd::get_desktop_count().unwrap_or(1) as usize;
+        let label_mode = vertical_label_mode(taskbar_hwnd, taskbar, edge);
+        let dots_vertical = edge.is_vertical() && !label_mode;
+
+        // In label mode the dots form a horizontal row sized against a standard
+        // taskbar thickness (not the whole wide column), shrunk if needed so the
+        // row still fits inside the column's width.
+        let cross = if label_mode {
+            fit_scale(icon_scale(taskbar_dpi(taskbar_hwnd)), thickness, count)
+        } else {
+            thickness
+        };
+
+        Some(Self {
+            edge,
+            dots_vertical,
+            cross,
+            length: indicator_length(cross, count),
+        })
+    }
+
+    /// Physical bitmap / window size `(width, height)`.
+    fn physical_size(&self) -> (i32, i32) {
+        if self.dots_vertical {
+            (self.cross, self.length)
+        } else {
+            (self.length, self.cross)
+        }
+    }
+}
+
+/// A 32-bit ARGB drawing surface addressed in *logical* coordinates:
+/// `x` runs along the taskbar (its length) and `y` runs across it (its
+/// thickness). For a vertical taskbar the pixels are transposed while writing,
+/// so all the dot layout math stays axis-agnostic.
+struct Canvas<'a> {
+    buffer: &'a mut [u32],
+    phys_width: i32,
+    phys_height: i32,
+    vertical: bool,
+}
+
+impl<'a> Canvas<'a> {
+    fn new(buffer: &'a mut [u32], phys_width: i32, phys_height: i32, vertical: bool) -> Self {
+        Self {
+            buffer,
+            phys_width,
+            phys_height,
+            vertical,
+        }
+    }
+
+    /// Maps logical `(x, y)` to a buffer index, or `None` when out of bounds.
+    #[inline]
+    fn index(&self, x: i32, y: i32) -> Option<usize> {
+        if x < 0 || y < 0 {
+            return None;
+        }
+        let (px, py) = if self.vertical { (y, x) } else { (x, y) };
+        if px >= self.phys_width || py >= self.phys_height {
+            return None;
+        }
+        Some(py as usize * self.phys_width as usize + px as usize)
+    }
+
+    #[inline]
+    fn get(&self, x: i32, y: i32) -> u32 {
+        self.index(x, y).map(|i| self.buffer[i]).unwrap_or(0)
+    }
+
+    #[inline]
+    fn set(&mut self, x: i32, y: i32, value: u32) {
+        if let Some(i) = self.index(x, y) {
+            self.buffer[i] = value;
+        }
+    }
+}
+
 /// Shared geometry of the virtual-desktop dots. Used both when rendering and
 /// when hit-testing the mouse, so the hover zones always line up with the dots.
 struct DotLayout {
@@ -28,10 +249,10 @@ struct DotLayout {
     start_x: f32,
 }
 
-fn dot_layout(height: i32) -> DotLayout {
-    // Taskbar at 1080p is usually 48px high, at 4K (200%) it's 96px high.
-    // Binding to Taskbar height keeps the aspect ratio 100% accurate on all screens.
-    let radius = height as f32 * 0.07; // Radius = 7% height (equivalent to ~3.36px at 1080p)
+fn dot_layout(thickness: i32) -> DotLayout {
+    // Taskbar at 1080p is usually 48px thick, at 4K (200%) it's 96px thick.
+    // Binding to the taskbar thickness keeps the dot size consistent everywhere.
+    let radius = thickness as f32 * 0.07; // Radius = 7% thickness (equivalent to ~3.36px at 1080p)
     let spacing = radius * 5.0;
     let start_x = 10.0 + radius;
     DotLayout {
@@ -41,11 +262,12 @@ fn dot_layout(height: i32) -> DotLayout {
     }
 }
 
-/// Total window width needed so the last dot (and its hover hitbox) is fully
-/// visible. Derived from the desktop count instead of a fixed constant: adding
-/// desktops never clips the indicator, and few desktops don't leave a dead zone.
-fn indicator_width(height: i32, count: usize) -> i32 {
-    let layout = dot_layout(height);
+/// Total length needed along the taskbar so the last dot (and its hover hitbox)
+/// is fully visible. Derived from the desktop count instead of a fixed
+/// constant: adding desktops never clips the indicator, and few desktops don't
+/// leave a dead zone.
+fn indicator_length(thickness: i32, count: usize) -> i32 {
+    let layout = dot_layout(thickness);
     let last_center = layout.start_x + count.saturating_sub(1) as f32 * layout.spacing;
     // The last hitbox extends half a spacing past its center; the enlarged dot
     // (1.25x radius when active/hovered) is always smaller than that.
@@ -70,26 +292,25 @@ static MOVE_TARGET_INDEX: AtomicI32 = AtomicI32::new(-1);
 /// during `render()` without access to the struct.
 static INDICATOR_POSITION: AtomicU8 = AtomicU8::new(0);
 
-fn get_hovered_index(x: i32) -> Option<usize> {
+/// Returns the index of the dot under a mouse message, using the coordinate
+/// along the dots' axis (`x` for a horizontal dot row, `y` for a vertical dot
+/// column). `x`/`y` are the client coordinates from the message's `LPARAM`.
+fn get_hovered_index(x: i32, y: i32) -> Option<usize> {
     unsafe {
+        let taskbar_hwnd = FindWindowW(w!("Shell_TrayWnd"), None).ok()?;
         let mut tray_rect = RECT::default();
-        if let Ok(taskbar_hwnd) = FindWindowW(w!("Shell_TrayWnd"), None) {
-            let _ = GetWindowRect(taskbar_hwnd, &mut tray_rect);
-        }
-        let height = tray_rect.bottom - tray_rect.top;
-        if height <= 0 {
-            return None;
-        }
+        let _ = GetWindowRect(taskbar_hwnd, &mut tray_rect);
+        let geom = IndicatorGeometry::detect(taskbar_hwnd, tray_rect)?;
 
         let count = winvd::get_desktop_count().unwrap_or(1) as usize;
-        let layout = dot_layout(height);
+        let layout = dot_layout(geom.cross);
         let half_spacing = layout.spacing / 2.0;
-        let px = x as f32;
+        let along = (if geom.dots_vertical { y } else { x }) as f32;
 
         for i in 0..count {
             let cx = layout.start_x + (i as f32) * layout.spacing;
             // Switch to rectangular Hit-box (like a div block), connected continuously without gaps
-            if px >= cx - half_spacing && px <= cx + half_spacing {
+            if along >= cx - half_spacing && along <= cx + half_spacing {
                 return Some(i);
             }
         }
@@ -132,15 +353,31 @@ fn tray_notify_left() -> Option<i32> {
     }
 }
 
+/// Top edge (screen coords) of the primary taskbar's system tray
+/// (`TrayNotifyWnd`). Used to keep the indicator above the tray on a vertical
+/// taskbar, mirroring [`tray_notify_left`] for the horizontal case.
+fn tray_notify_top() -> Option<i32> {
+    unsafe {
+        let tray = FindWindowW(w!("Shell_TrayWnd"), None).ok()?;
+        let notify = FindWindowExW(Some(tray), None, w!("TrayNotifyWnd"), None).ok()?;
+        if notify.is_invalid() {
+            return None;
+        }
+        let mut rect = RECT::default();
+        GetWindowRect(notify, &mut rect).ok()?;
+        Some(rect.top)
+    }
+}
+
 /// Placement of the virtual desktop indicator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndicatorPosition {
-    /// Alignment-aware: left edge (Center-aligned taskbar) or just left of the
-    /// system tray (Left-aligned taskbar).
+    /// Alignment-aware: the start edge (left / top of a vertical bar) or just
+    /// before the system tray, mirroring the taskbar alignment.
     Auto = 0,
-    /// Fixed at the left edge of the taskbar.
+    /// Fixed at the start of the taskbar (left edge / top of a vertical bar).
     Left = 1,
-    /// Fixed just left of the system tray (right side).
+    /// Fixed just before the system tray (right / bottom of a vertical bar).
     Right = 2,
 }
 
@@ -160,12 +397,12 @@ impl IndicatorPosition {
 
 /// Computes the screen X where the indicator should sit, according to the
 /// configured [`IndicatorPosition`].
-fn indicator_left(taskbar: RECT, width: i32) -> i32 {
+fn indicator_left(taskbar: RECT, length: i32) -> i32 {
     let position = IndicatorPosition::from_u8(INDICATOR_POSITION.load(Ordering::Relaxed));
     let tray_left = tray_notify_left();
     let left_of_tray = match tray_left {
-        Some(l) => (l - INDICATOR_MARGIN - width).max(taskbar.left),
-        None => taskbar.right - INDICATOR_MARGIN - width,
+        Some(l) => (l - INDICATOR_MARGIN - length).max(taskbar.left),
+        None => taskbar.right - INDICATOR_MARGIN - length,
     };
 
     match position {
@@ -176,6 +413,48 @@ fn indicator_left(taskbar: RECT, width: i32) -> i32 {
                 left_of_tray
             } else {
                 taskbar.left + 10
+            }
+        }
+    }
+}
+
+/// Screen coordinates (top-left) at which the indicator window is placed.
+///
+/// For a horizontal taskbar the indicator is offset along X (via
+/// [`indicator_left`]). For a vertical taskbar it lies inside the column: offset
+/// along Y by the position preset, and centered across the column for the
+/// horizontal (label-mode) dot row.
+fn indicator_origin(taskbar: RECT, geom: IndicatorGeometry) -> (i32, i32) {
+    if !geom.edge.is_vertical() {
+        return (indicator_left(taskbar, geom.length), taskbar.top);
+    }
+
+    let thickness = taskbar.right - taskbar.left;
+    let x = if geom.dots_vertical {
+        taskbar.left
+    } else {
+        taskbar.left + (thickness - geom.length).max(0) / 2
+    };
+    (x, vertical_anchor(taskbar, geom.length))
+}
+
+/// Vertical position of the indicator along a vertical taskbar: `Left` pins it
+/// to the top (start), `Right` just above the system tray (end), and `Auto`
+/// mirrors the horizontal alignment rule instead of centering on the taskbar.
+fn vertical_anchor(taskbar: RECT, length: i32) -> i32 {
+    let position = IndicatorPosition::from_u8(INDICATOR_POSITION.load(Ordering::Relaxed));
+    let above_tray = match tray_notify_top() {
+        Some(top) => (top - INDICATOR_MARGIN - length).max(taskbar.top),
+        None => taskbar.bottom - INDICATOR_MARGIN - length,
+    };
+    match position {
+        IndicatorPosition::Left => taskbar.top + 10,
+        IndicatorPosition::Right => above_tray,
+        IndicatorPosition::Auto => {
+            if taskbar_alignment_left() {
+                above_tray
+            } else {
+                taskbar.top + 10
             }
         }
     }
@@ -396,19 +675,20 @@ impl IndicatorWindow {
         let taskbar_hwnd = FindWindowW(w!("Shell_TrayWnd"), None)?;
         let mut tray_rect = RECT::default();
         let _ = GetWindowRect(taskbar_hwnd, &mut tray_rect);
-        let taskbar_height = tray_rect.bottom - tray_rect.top;
-        let count = winvd::get_desktop_count().unwrap_or(1) as usize;
-        let width = indicator_width(taskbar_height, count);
+        let geom = IndicatorGeometry::detect(taskbar_hwnd, tray_rect)
+            .ok_or_else(|| anyhow::anyhow!("taskbar rectangle is unavailable"))?;
+        let (window_width, window_height) = geom.physical_size();
+        let (window_x, window_y) = indicator_origin(tray_rect, geom);
 
         let hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class_name,
             w!("Indicator"),
             WS_POPUP | WS_VISIBLE,
-            indicator_left(tray_rect, width),
-            tray_rect.top,
-            width,
-            taskbar_height,
+            window_x,
+            window_y,
+            window_width,
+            window_height,
             Some(taskbar_hwnd),
             None,
             Some(hinstance.into()),
@@ -477,24 +757,28 @@ impl IndicatorWindow {
     /// To be honest, I don't even know how this function works anymore :P
     pub fn render(hwnd: HWND) {
         unsafe {
+            let taskbar_hwnd = match FindWindowW(w!("Shell_TrayWnd"), None) {
+                Ok(h) => h,
+                Err(_) => return,
+            };
             let mut tray_rect = RECT::default();
-            if let Ok(taskbar_hwnd) = FindWindowW(w!("Shell_TrayWnd"), None) {
-                let _ = GetWindowRect(taskbar_hwnd, &mut tray_rect);
-            }
-            let height = tray_rect.bottom - tray_rect.top;
-            if height <= 0 {
-                return;
-            }
+            let _ = GetWindowRect(taskbar_hwnd, &mut tray_rect);
+            let geom = match IndicatorGeometry::detect(taskbar_hwnd, tray_rect) {
+                Some(g) => g,
+                None => return,
+            };
 
             let count = winvd::get_desktop_count().unwrap_or(1) as usize;
-            let layout = dot_layout(height);
-            let width = indicator_width(height, count);
+            let layout = dot_layout(geom.cross);
+            let length = geom.length;
+            let thickness = geom.cross;
+            let (phys_width, phys_height) = geom.physical_size();
 
             let bmi = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
                     biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: width,
-                    biHeight: -height, // top-down
+                    biWidth: phys_width,
+                    biHeight: -phys_height, // top-down
                     biPlanes: 1,
                     biBitCount: 32,
                     biCompression: BI_RGB.0 as u32,
@@ -514,7 +798,8 @@ impl IndicatorWindow {
 
                 // Point rust array to image buffer
                 // Fill with black background but 0 transparency (Alpha = 0) => 100% invisible
-                let buffer = from_raw_parts_mut(ppvbits as *mut u32, (width * height) as usize);
+                let buffer =
+                    from_raw_parts_mut(ppvbits as *mut u32, (phys_width * phys_height) as usize);
                 buffer.fill(0);
 
                 let light_mode = utils::is_light_theme();
@@ -530,7 +815,7 @@ impl IndicatorWindow {
                 let radius = layout.radius;
                 let spacing = layout.spacing;
                 let start_x = layout.start_x;
-                let cy = height as f32 / 2.0;
+                let cy = thickness as f32 / 2.0;
                 let current = winvd::get_current_desktop().ok();
                 let desktops = winvd::get_desktops().unwrap_or_default();
                 let mut current_idx = 0;
@@ -546,6 +831,8 @@ impl IndicatorWindow {
                 let hover_idx = HOVER_INDEX.load(Ordering::Relaxed);
                 let move_mode = move_modifier_down();
 
+                let mut canvas = Canvas::new(buffer, phys_width, phys_height, geom.dots_vertical);
+
                 for i in 0..count {
                     let cx = start_x + (i as f32) * spacing;
                     let is_hovered = hover_idx == (i as isize);
@@ -553,9 +840,9 @@ impl IndicatorWindow {
                     // Draw invisible Div block (Alpha = 1) as a Hitbox surrounding the dot.
                     // If hovering, draw a slight rounded background (Alpha = 0.15)
                     Self::draw_hitbox_and_bg(
-                        buffer,
-                        width,
-                        height,
+                        &mut canvas,
+                        length,
+                        thickness,
                         cx,
                         spacing,
                         is_hovered,
@@ -582,9 +869,9 @@ impl IndicatorWindow {
                     }
 
                     Self::draw_aa_circle(
-                        buffer,
-                        width,
-                        height,
+                        &mut canvas,
+                        length,
+                        thickness,
                         cx,
                         cy,
                         current_radius,
@@ -594,14 +881,15 @@ impl IndicatorWindow {
                 }
 
                 // Update to screen
+                let (window_x, window_y) = indicator_origin(tray_rect, geom);
                 let mut pt_src = POINT { x: 0, y: 0 };
                 let mut size = SIZE {
-                    cx: width,
-                    cy: height,
+                    cx: phys_width,
+                    cy: phys_height,
                 };
                 let mut pt_dst = POINT {
-                    x: indicator_left(tray_rect, width),
-                    y: tray_rect.top,
+                    x: window_x,
+                    y: window_y,
                 };
                 let mut blend = BLENDFUNCTION {
                     BlendOp: AC_SRC_OVER as u8,
@@ -633,9 +921,9 @@ impl IndicatorWindow {
 
     /// Draws an "invisible" rectangular block (Hitbox) and blurred rounded background on Hover
     fn draw_hitbox_and_bg(
-        buffer: &mut [u32],
-        width: i32,
-        height: i32,
+        canvas: &mut Canvas<'_>,
+        length: i32,
+        thickness: i32,
         cx: f32,
         spacing: f32,
         is_hovered: bool,
@@ -644,19 +932,19 @@ impl IndicatorWindow {
     ) {
         let half_spacing = spacing / 2.0;
         let min_x = (cx - half_spacing).floor().max(0.0) as i32;
-        let max_x = (cx + half_spacing).ceil().min((width - 1) as f32) as i32;
+        let max_x = (cx + half_spacing).ceil().min((length - 1) as f32) as i32;
         let min_y = 0;
-        let max_y = height - 1;
+        let max_y = thickness - 1;
 
-        let cy = height as f32 / 2.0;
+        let cy = thickness as f32 / 2.0;
 
-        // bg_rw: Horizontal radius of hover background (Width = bg_rw * 2)
+        // bg_rw: radius of the hover background along the taskbar (Width = bg_rw * 2)
         // Instead of subtracting margin, we leave `spacing / 2.0` so hover backgrounds touch continuously (no gap)
         let bg_rw = spacing / 2.0;
 
-        // bg_rh: Vertical radius of hover background (Height = bg_rh * 2)
-        // Subtract 6px to create padding from the top/bottom edges of the Taskbar
-        let bg_rh = (height as f32) / 2.0 - 6.0;
+        // bg_rh: radius of the hover background across the taskbar (Height = bg_rh * 2)
+        // Subtract 6px to create padding from the taskbar edges
+        let bg_rh = (thickness as f32) / 2.0 - 6.0;
 
         // Corner radius of hover background (Larger means rounder, max is bg_rh)
         let corner_radius = 6.0;
@@ -681,10 +969,6 @@ impl IndicatorWindow {
             for x in min_x..=max_x {
                 let px = x as f32 + 0.5;
                 let py = y as f32 + 0.5;
-                let idx = (y * width + x) as usize;
-                if idx >= buffer.len() {
-                    continue;
-                }
 
                 if is_hovered {
                     let dx = (px - cx).abs() - inner_w;
@@ -706,24 +990,24 @@ impl IndicatorWindow {
                         let pr = (r as f32 * alpha) as u32;
                         let pg = (g as f32 * alpha) as u32;
                         let pb = (b as f32 * alpha) as u32;
-                        buffer[idx] = (a << 24) | (pr << 16) | (pg << 8) | pb;
+                        canvas.set(x, y, (a << 24) | (pr << 16) | (pg << 8) | pb);
                         continue;
                     }
                 }
 
                 // Invisible hitbox
-                if buffer[idx] == 0 {
-                    buffer[idx] = 0x01000000;
+                if canvas.get(x, y) == 0 {
+                    canvas.set(x, y, 0x01000000);
                 }
             }
         }
     }
 
-    /// Draws an anti-aliased SDF circle directly onto a 32-bit ARGB buffer.
+    /// Draws an anti-aliased SDF circle onto the logical canvas.
     fn draw_aa_circle(
-        buffer: &mut [u32],
-        width: i32,
-        height: i32,
+        canvas: &mut Canvas<'_>,
+        length: i32,
+        thickness: i32,
         cx: f32,
         cy: f32,
         radius: f32,
@@ -733,9 +1017,9 @@ impl IndicatorWindow {
         let (r, g, b) = color;
 
         let min_x = (cx - radius - 1.0).floor().max(0.0) as i32;
-        let max_x = (cx + radius + 1.0).ceil().min((width - 1) as f32) as i32;
+        let max_x = (cx + radius + 1.0).ceil().min((length - 1) as f32) as i32;
         let min_y = (cy - radius - 1.0).floor().max(0.0) as i32;
-        let max_y = (cy + radius + 1.0).ceil().min((height - 1) as f32) as i32;
+        let max_y = (cy + radius + 1.0).ceil().min((thickness - 1) as f32) as i32;
 
         for y in min_y..=max_y {
             for x in min_x..=max_x {
@@ -762,12 +1046,7 @@ impl IndicatorWindow {
                     let pg = (g as f32 * alpha) as u32;
                     let pb = (b as f32 * alpha) as u32;
 
-                    let new_pixel = (a << 24) | (pr << 16) | (pg << 8) | pb;
-                    let idx = (y * width + x) as usize;
-
-                    if idx < buffer.len() {
-                        buffer[idx] = new_pixel;
-                    }
+                    canvas.set(x, y, (a << 24) | (pr << 16) | (pg << 8) | pb);
                 }
             }
         }
@@ -799,8 +1078,10 @@ impl IndicatorWindow {
                 LRESULT(0)
             }
             WM_MOUSEMOVE => {
-                let x = ((lparam.0 as i32) << 16) >> 16;
-                let hovered = get_hovered_index(x);
+                let packed = lparam.0 as i32;
+                let x = (packed << 16) >> 16;
+                let y = packed >> 16;
+                let hovered = get_hovered_index(x, y);
                 let old = HOVER_INDEX.load(std::sync::atomic::Ordering::Relaxed);
                 let new_val = hovered.map(|i| i as isize).unwrap_or(-1);
 
@@ -826,8 +1107,10 @@ impl IndicatorWindow {
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
-                let x = ((lparam.0 as i32) << 16) >> 16;
-                if let Some(idx) = get_hovered_index(x) {
+                let packed = lparam.0 as i32;
+                let x = (packed << 16) >> 16;
+                let y = packed >> 16;
+                if let Some(idx) = get_hovered_index(x, y) {
                     if let Ok(desktops) = winvd::get_desktops() {
                         if idx < desktops.len() {
                             if move_modifier_down() {
@@ -842,11 +1125,13 @@ impl IndicatorWindow {
                 LRESULT(0)
             }
             WM_RBUTTONUP => {
-                let x = ((lparam.0 as i32) << 16) >> 16;
+                let packed = lparam.0 as i32;
+                let x = (packed << 16) >> 16;
+                let y = packed >> 16;
                 // The right-clicked dot tells us exactly which desktop N to act on.
                 // Capture the target first: showing the menu temporarily takes
                 // foreground, so we can't derive it again from GetForegroundWindow.
-                if let Some(idx) = get_hovered_index(x) {
+                if let Some(idx) = get_hovered_index(x, y) {
                     if let Some(target) = foreground_target_window() {
                         MOVE_TARGET_HWND.store(target.0 as isize, Ordering::Relaxed);
                         MOVE_TARGET_INDEX.store(idx as i32, Ordering::Relaxed);
