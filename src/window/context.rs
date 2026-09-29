@@ -1,3 +1,5 @@
+//! A snapshot of the current foreground window, monitor and virtual desktop.
+
 use windows::Win32::{
     Foundation::{HWND, POINT},
     Graphics::Gdi::{MonitorFromPoint, MonitorFromWindow, HMONITOR, MONITOR_DEFAULTTONEAREST},
@@ -6,8 +8,8 @@ use windows::Win32::{
 use winvd::{get_current_desktop, Desktop};
 
 #[allow(dead_code)]
-/// The context of something in Windows? (can you get a better name?) Including the
-/// foreground window, monitor, and virtual desktop.
+/// The desktop context around the user: the foreground window, the monitor it
+/// is (or the cursor is) on, and the active virtual desktop.
 pub struct WindowContext {
     pub foreground_window: HWND,
     pub monitor: HMONITOR,

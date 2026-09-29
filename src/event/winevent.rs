@@ -11,10 +11,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     INDEXID_CONTAINER, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
 };
 
+use crate::app::messages::WM_APP_UNCOMBINE;
 use crate::taskbar::UncombineManager;
-use crate::utils::is_system_class;
-
-pub const WM_APP_UNCOMBINE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 0x100;
+use crate::window::system_class::is_system_class;
 
 static MAIN_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 static UNCOMBINE: AtomicPtr<UncombineManager> = AtomicPtr::new(std::ptr::null_mut());

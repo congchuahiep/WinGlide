@@ -1,3 +1,6 @@
+//! The parsed command line: [`RunMode`] and the flags in [`Args`].
+
+/// How WinGlide was launched.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RunMode {
     ConsoleWorker,

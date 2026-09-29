@@ -19,8 +19,7 @@ use windows::Win32::UI::Accessibility::{
 use windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW;
 
 use super::winevent::InvalidateSource;
-
-pub const WM_APP_INVALIDATE_CACHE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 0x101;
+use crate::app::messages::WM_APP_INVALIDATE_CACHE;
 
 /// Flag to prevent sending duplicate messages when multiple UIA events fire in rapid succession.
 pub static CACHE_INVALIDATED: AtomicBool = AtomicBool::new(false);

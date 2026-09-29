@@ -1,3 +1,8 @@
+//! Reads and writes a window's AppUserModelID (AUMID).
+//!
+//! The AUMID is the documented mechanism Windows uses to group taskbar buttons,
+//! so the uncombine feature rewrites it to give each window its own button.
+
 use windows::Win32::{
     Foundation::{CloseHandle, HWND},
     Storage::{EnhancedStorage::PKEY_AppUserModel_ID, Packaging::Appx::GetApplicationUserModelId},

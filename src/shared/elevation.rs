@@ -1,7 +1,7 @@
-//! Provides utilities for checking and requesting Windows Administrator privileges.
+//! Administrator-privilege checks and elevated restart.
 //!
-//! This module contains functions to query the current process token for elevation status
-//! and to restart the application requesting elevated privileges via the UAC prompt.
+//! Queries the current process token for elevation status and restarts the
+//! application through the UAC prompt via `ShellExecuteW("runas", ...)`.
 
 use std::env;
 use std::os::windows::ffi::OsStrExt;
@@ -74,7 +74,11 @@ pub fn restart_as_admin(reopen_ui: bool) -> anyhow::Result<()> {
             None,
             w!("runas"),
             PCWSTR(exe_path_u16.as_ptr()),
-            if reopen_ui { PCWSTR(args_u16.as_ptr()) } else { PCWSTR::null() },
+            if reopen_ui {
+                PCWSTR(args_u16.as_ptr())
+            } else {
+                PCWSTR::null()
+            },
             PCWSTR::null(),
             windows::Win32::UI::WindowsAndMessaging::SW_SHOW,
         );
@@ -82,7 +86,10 @@ pub fn restart_as_admin(reopen_ui: bool) -> anyhow::Result<()> {
         if res.0 as isize > 32 {
             std::process::exit(0);
         } else {
-            anyhow::bail!("Failed to restart as administrator. Error code: {}", res.0 as isize);
+            anyhow::bail!(
+                "Failed to restart as administrator. Error code: {}",
+                res.0 as isize
+            );
         }
     }
 }

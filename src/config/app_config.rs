@@ -33,8 +33,22 @@ pub struct AppConfig {
     #[serde(default)]
     pub indicator_position: u8,
 
+    /// Paint the Desktop Indicator dots with the Windows accent color
+    #[serde(default = "default_true")]
+    pub indicator_accent_color: bool,
+
+    /// Draw a translucent background behind the Desktop Indicator dot row
+    #[serde(default = "default_true")]
+    pub indicator_background: bool,
+
     /// Modifiers for the Jump to Desktop hotkey (e.g. Alt + <number>)
     pub jump_desktop_modifiers: u32,
+}
+
+/// Serde default for boolean indicator options that should apply to configs
+/// written before the field existed.
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AppConfig {
@@ -48,6 +62,8 @@ impl Default for AppConfig {
             hotkey_right_modifiers: MOD_ALT.0 as u32,
             desktop_indicator: true,
             indicator_position: 0, // Auto
+            indicator_accent_color: true,
+            indicator_background: true,
             jump_desktop_modifiers: MOD_ALT.0 as u32,
         }
     }

@@ -1,10 +1,13 @@
-//! Provides the Settings UI components for the application.
+//! The Settings UI and the app-level preferences it controls.
 //!
-//! This module contains user interface definitions built on top of the `windows-reactor` crate,
-//! including taskbar settings, custom components like Expanders, and the main UI layout.
+//! Built on `windows-reactor` (a native WinUI 3 binding). Besides the window
+//! itself, this feature owns the preferences that have no other home:
+//! autostart, administrator relaunch and the update check.
 
+mod autostart;
 mod hotkey_button;
 mod setting_item;
-mod ui;
+mod settings_window;
+mod update_checker;
 
-pub use ui::*;
+pub use settings_window::*;

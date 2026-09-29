@@ -1,5 +1,9 @@
-//! Root UI module for the Settings application.
-//! Initializes the main layout structure including Header, Settings items, Logging, and Footer.
+//! The main Settings window: builds the layout from the feature sections
+//! (taskbar, virtual desktop, system, updates) and drives config persistence.
+//!
+//! Also owns the two IPC helpers that poke the background app
+//! (`--reload-config` / `--restart-as-admin` messages) and the process job
+//! object that ties the UI process to the background one.
 
 use crate::config::AppConfig;
 use crate::setting::hotkey_button;
@@ -27,7 +31,7 @@ fn send_reload_signal() {
             if !hwnd.is_invalid() {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(hwnd),
-                    crate::event::WM_APP_RELOAD_CONFIG,
+                    crate::app::messages::WM_APP_RELOAD_CONFIG,
                     windows::Win32::Foundation::WPARAM(0),
                     windows::Win32::Foundation::LPARAM(0),
                 );
@@ -45,7 +49,7 @@ fn send_restart_admin_signal() {
             if !hwnd.is_invalid() {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(hwnd),
-                    crate::event::WM_APP_RESTART_AS_ADMIN,
+                    crate::app::messages::WM_APP_RESTART_AS_ADMIN,
                     windows::Win32::Foundation::WPARAM(1),
                     windows::Win32::Foundation::LPARAM(0),
                 );
@@ -316,6 +320,40 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
         ..Default::default()
     });
 
+    let accent_action: Element = ToggleSwitch::new(config.indicator_accent_color)
+        .on_content("")
+        .off_content("")
+        .min_width(0.0)
+        .width(42.)
+        .on_changed({
+            let set_config = set_config.clone();
+            move |checked| {
+                let mut new_config = crate::config::AppConfig::load();
+                new_config.indicator_accent_color = checked;
+                new_config.save();
+                set_config.call(new_config);
+                send_reload_signal();
+            }
+        })
+        .into();
+
+    let background_action: Element = ToggleSwitch::new(config.indicator_background)
+        .on_content("")
+        .off_content("")
+        .min_width(0.0)
+        .width(42.)
+        .on_changed({
+            let set_config = set_config.clone();
+            move |checked| {
+                let mut new_config = crate::config::AppConfig::load();
+                new_config.indicator_background = checked;
+                new_config.save();
+                set_config.call(new_config);
+                send_reload_signal();
+            }
+        })
+        .into();
+
     vstack((
         body_strong("Virtual Desktop").margin(Thickness {
             bottom: 10.,
@@ -362,6 +400,24 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
                     children: None,
                     always_expand: false,
                     enabled: config.desktop_indicator,
+                }, SettingItemProps {
+                    icon: None,
+                    title: Some("Accent Color".into()),
+                    description: Some(
+                        "Use the Windows accent color for the dots instead of the theme color".into(),
+                    ),
+                    action: Some(accent_action),
+                    children: None,
+                    always_expand: false,
+                    enabled: config.desktop_indicator,
+                }, SettingItemProps {
+                    icon: None,
+                    title: Some("Background".into()),
+                    description: Some("Draw a translucent background behind the dots".into()),
+                    action: Some(background_action),
+                    children: None,
+                    always_expand: false,
+                    enabled: config.desktop_indicator,
                 }]),
                 always_expand: true,
                 enabled: true,
@@ -386,7 +442,8 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
 }
 
 fn system_settings(cx: &mut RenderCx) -> Element {
-    let (autostart, set_autostart) = cx.use_state(crate::autostart::is_autostart_enabled());
+    let (autostart, set_autostart) =
+        cx.use_state(crate::setting::autostart::is_autostart_enabled());
 
     vstack((
         body_strong("System").margin(Thickness {
@@ -406,7 +463,7 @@ fn system_settings(cx: &mut RenderCx) -> Element {
                         .width(42.)
                         .on_changed({
                             move |checked| {
-                                if crate::autostart::set_autostart(checked).is_ok() {
+                                if crate::setting::autostart::set_autostart(checked).is_ok() {
                                     set_autostart.call(checked);
                                 }
                             }
@@ -423,12 +480,12 @@ fn system_settings(cx: &mut RenderCx) -> Element {
             &SettingItemProps {
                 icon: Some('\u{E7EF}'),
                 title: Some("Administrator Privileges".into()),
-                description: Some(if crate::admin::is_running_as_admin() {
+                description: Some(if crate::shared::elevation::is_running_as_admin() {
                     "Running as Administrator. All features are available.".into()
                 } else {
                     "Restart as Administrator to interact with elevated windows.".into()
                 }),
-                action: Some(if crate::admin::is_running_as_admin() {
+                action: Some(if crate::shared::elevation::is_running_as_admin() {
                     button("Elevated").enabled(false).into()
                 } else {
                     button("Restart")
@@ -450,7 +507,7 @@ fn system_settings(cx: &mut RenderCx) -> Element {
 
 fn update_settings(cx: &mut RenderCx) -> Element {
     let (update_info, set_update_info) =
-        cx.use_async_state::<Option<crate::updater::UpdateInfo>>(None);
+        cx.use_async_state::<Option<crate::setting::update_checker::UpdateInfo>>(None);
     let (checking, set_checking) = cx.use_async_state(false);
 
     vstack((
@@ -493,7 +550,9 @@ fn update_settings(cx: &mut RenderCx) -> Element {
                                 let set_checking_clone = set_checking.clone();
                                 let set_update_info_clone = set_update_info.clone();
                                 std::thread::spawn(move || {
-                                    if let Ok(Some(info)) = crate::updater::check_for_updates() {
+                                    if let Ok(Some(info)) =
+                                        crate::setting::update_checker::check_for_updates()
+                                    {
                                         set_update_info_clone.call(Some(info));
                                     }
                                     set_checking_clone.call(false);

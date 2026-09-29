@@ -6,23 +6,18 @@
 
 #![windows_subsystem = "windows"]
 
-mod admin;
 mod app;
-mod autostart;
-mod bootstrap;
 mod cli;
 mod config;
 mod event;
 mod hotkey;
 mod logging;
 mod setting;
+mod shared;
 mod taskbar;
-mod tray_icon;
-mod types;
-mod updater;
-mod utils;
+mod tray;
 mod virtual_desktop;
-mod win32;
+mod window;
 
 /// Displays a fatal error message box to the user.
 ///
@@ -110,7 +105,7 @@ fn dispatch() -> anyhow::Result<()> {
     let args = cli::parse_args();
 
     if args.debug {
-        bootstrap::attach_debug_console();
+        logging::debug_console::attach_debug_console();
     }
 
     match args.mode {
@@ -118,19 +113,19 @@ fn dispatch() -> anyhow::Result<()> {
             logging::console::run_worker();
         }
         cli::RunMode::SettingsUi => {
-            if bootstrap::ensure_single_instance(bootstrap::InstanceType::SettingsUI) {
+            if app::ensure_single_instance(app::InstanceType::SettingsUI) {
                 let _guard = logging::setup_logger(args.verbose);
                 tracing::info!("Starting settings UI process");
                 setting::run()?;
             }
         }
         cli::RunMode::BackgroundApp => {
-            if bootstrap::ensure_single_instance(bootstrap::InstanceType::Background) {
+            if app::ensure_single_instance(app::InstanceType::Background) {
                 cli::print_help(&args);
                 let _guard = logging::setup_logger(args.verbose);
-                bootstrap::setup_dpi_awareness();
+                app::setup_dpi_awareness();
 
-                let config = crate::config::AppConfig::load();
+                let config = config::AppConfig::load();
                 let mut app = app::App::new(&config)?;
 
                 if args.reopen_ui {

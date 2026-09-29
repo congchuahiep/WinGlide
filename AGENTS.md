@@ -27,7 +27,7 @@ cargo run -- --debug --verbose     # run with debug console + verbose logging
 
 No lint/formatter config exists in the repo - only `cargo check` / `cargo build` are available.
 
-## CLI args (manual parsing in cli.rs, no clap)
+## CLI args (manual parsing in `cli/args.rs`, no clap)
 
 - `-v` / `--verbose` - enable debug-level logging
 - `--debug` - attach/alloc console for debug logging (also enables console worker)
@@ -39,42 +39,75 @@ No lint/formatter config exists in the repo - only `cargo check` / `cargo build`
 
 ## Architecture
 
+The crate is **feature-based**: only `main.rs` lives at `src/`, and every feature is a
+directory whose `mod.rs` is a pure table of contents (no definitions). Files are named
+after what they contain - a feature's primary type lives in a file named after that type,
+shared data structs live in `types.rs`, small helpers in `utils.rs`.
+
 ```
-main.rs                     -> panic hook -> dispatch: cli::parse_args -> bootstrap (single-instance, DPI, debug console) -> mode routing
-cli.rs                      -> manual arg parsing (RunMode: ConsoleWorker / SettingsUi / BackgroundApp)
-config.rs                   -> AppConfig: serde JSON at %APPDATA%/WinGlide/config.json (see "Config")
-bootstrap.rs                -> ensure_single_instance (named mutex), attach_debug_console, setup_dpi_awareness
-app.rs                      -> orchestrator: wires hotkey_manager + key_hook + enumerator + uncombine_manager + tray + indicator + hidden window
+main.rs                     -> panic hook -> dispatch: cli::parse_args -> app (single-instance, DPI, debug console) -> mode routing
+app/
+├── mod.rs                  -> re-export: App, ensure_single_instance, InstanceType, setup_dpi_awareness
+├── orchestrator.rs         -> App: wires hotkey_manager + key_hook + enumerator + uncombine_manager + tray + indicator + hidden window
+├── messages.rs             -> custom message IDs: WM_APP_UNCOMBINE/INVALIDATE_CACHE/RELOAD_CONFIG/RESTART_AS_ADMIN, WM_USER_TRAYICON
+├── single_instance.rs      -> ensure_single_instance (named mutex) + InstanceType
+└── dpi_awareness.rs        -> setup_dpi_awareness (Per-Monitor V2)
+cli/
+├── mod.rs                  -> re-export: parse_args, print_help, RunMode
+└── args.rs                 -> manual arg parsing (Args / RunMode: ConsoleWorker / SettingsUi / BackgroundApp)
+config/
+├── mod.rs                  -> re-export: AppConfig
+└── app_config.rs           -> AppConfig: serde JSON at %APPDATA%/WinGlide/config.json (see "Config")
 hotkey/
-├── mod.rs                  -> module doc + re-export: HotkeyManager, HotkeyAction, LowLevelKeyHook
-├── manager.rs              -> HotkeyManager: RegisterHotKey + dispatch classification; HotkeyAction::CycleLeft/CycleRight/SwitchVirtualDesktop(idx)
-└── low_level_hook.rs       -> generic WH_KEYBOARD_LL hook: overrides Windows-owned combos (any Win+key); posts WM_HOTKEY with the same IDs
-taskbar/
-├── mod.rs                  -> module doc + re-export: TaskbarEnumerator, CycleDirection, UncombineManager
-├── enumerator.rs           -> IUIAutomation: enumerate buttons, 1s TTL cache, cycle_to_neighbor
-├── button_window.rs        -> ButtonWindowMap: map button ↔ window (AUMID -> PID -> Title -> Process)
-└── uncombine.rs            -> UncombineManager: sets unique AppUserModelID per window
-win32/
-├── mod.rs                  -> re-exports win32 submodules
-├── window.rs               -> EnumWindows: find_visible_windows, get_process_name
-├── activate.rs             -> force_activate (SetForegroundWindow + AttachThreadInput)
-├── aumid.rs                -> get/window AUMID helpers (SHGetPropertyStoreForWindow)
-├── explorer.rs             -> get_explorer_pid, invalidate_explorer_pid_cache
-└── window_context.rs       -> WindowContext::current_state(): foreground window + monitor + virtual desktop
+├── mod.rs                  -> re-export: HotkeyManager, HotkeyAction, LowLevelKeyHook
+├── manager.rs              -> HotkeyManager: RegisterHotKey + dispatch classification (CycleLeft/CycleRight/SwitchVirtualDesktop)
+└── low_level_hook.rs       -> generic WH_KEYBOARD_LL hook: overrides Windows-owned Win+key combos; posts WM_HOTKEY with the same IDs
 event/
-├── mod.rs                  -> re-exports; defines WM_APP_RELOAD_CONFIG (0x102), WM_APP_RESTART_AS_ADMIN (0x103)
-├── uia.rs                  -> UIA StructureChanged hook -> WM_APP_INVALIDATE_CACHE (0x101)
-└── winevent.rs             -> WinEvent EVENT_OBJECT_SHOW hook -> WM_APP_UNCOMBINE (0x100)
+├── mod.rs                  -> re-export: WinEventHook, UiaEventHook, InvalidateSource, reset_cache_invalidated_flag
+├── uia.rs                  -> UIA StructureChanged hook -> WM_APP_INVALIDATE_CACHE
+└── winevent.rs             -> WinEvent EVENT_OBJECT_SHOW hook -> WM_APP_UNCOMBINE
+taskbar/
+├── mod.rs                  -> re-export: TaskbarEnumerator, CycleDirection, UncombineManager, Taskbar, TaskbarEdge, TaskbarButton, TargetWindow
+├── snapshot.rs             -> Taskbar/TaskbarEdge: edge, thickness, DPI, labels mode of Shell_TrayWnd
+├── enumerator.rs           -> IUIAutomation: enumerate buttons, 1s TTL cache, cycle_to_neighbor
+├── button_window.rs        -> ButtonWindowMap: map button <-> window (AUMID -> PID -> Title -> Process)
+├── uncombine.rs            -> UncombineManager: sets unique AppUserModelID per window
+├── explorer_process.rs     -> explorer.exe PID cache (distinguishes shell buttons from app buttons)
+├── types.rs                -> TaskbarButton, TargetWindow
+└── utils.rs                -> clean_button_name
+window/
+├── mod.rs                  -> re-export: WindowInfo
+├── types.rs                -> WindowInfo
+├── enumerate.rs            -> EnumWindows: find_visible_windows, find_window_by_hwnd, get_process_name
+├── activate.rs             -> force_activate (SetForegroundWindow + AttachThreadInput)
+├── aumid.rs                -> get/set window AUMID (SHGetPropertyStoreForWindow)
+├── context.rs              -> WindowContext::current_state(): foreground window + monitor + virtual desktop
+└── system_class.rs         -> is_system_class (shell/OS classes to ignore)
 virtual_desktop/
-└── indicator.rs            -> IndicatorWindow: layered window drawing desktop dots on the taskbar (winvd); left-click = switch desktop, right-click = "Move to Desktop" context menu, Alt+click = move foreground window there; placement (Auto/Left/Right) is user-configurable via Settings
-tray_icon.rs                -> Shell_NotifyIconW tray icon + context menu (Exit / Settings / Debug Console)
-setting/                    -> windows-reactor native GUI settings (hotkey capture, toggles, update check)
-logging/                    -> tracing-subscriber: rolling file + detached console via named pipes; tracing-forest format
-admin.rs                    -> is_running_as_admin, restart_as_admin (ShellExecuteW "runas")
-autostart.rs                -> HKCU\...\Run registry autostart enable/disable
-updater.rs                  -> GitHub Releases API check (reqwest blocking), finds .msi asset
-types.rs                    -> shared data structs (TaskbarButton, WindowInfo, TargetWindow), no logic, no imports
-utils.rs                    -> clean_button_name, truncate, is_system_class, is_light_theme
+├── mod.rs                  -> re-export: indicator
+└── indicator/              -> IndicatorWindow: layered window drawing desktop dots on the taskbar (winvd)
+                              left-click = switch desktop, right-click = "Move to Desktop" menu, Alt+click = move window there
+                              (IndicatorSettings mirrors the config; also DotPainter / IndicatorGeometry / Canvas / DesktopMover)
+tray/
+├── mod.rs                  -> re-export: TrayIcon, IDM_EXIT, IDM_SETTINGS, IDM_SHOW_CONSOLE
+└── tray_icon.rs            -> Shell_NotifyIconW tray icon + context menu (Exit / Settings / Debug Console)
+setting/
+├── mod.rs                  -> re-export: settings_window (run, show_ui)
+├── settings_window.rs      -> windows-reactor native GUI + IPC to the background app
+├── hotkey_button.rs        -> hotkey-capture control
+├── setting_item.rs         -> reusable settings row widget
+├── autostart.rs            -> HKCU\...\Run registry autostart enable/disable
+└── update_checker.rs       -> GitHub Releases API check (reqwest blocking), finds .msi asset
+logging/
+├── mod.rs                  -> re-export: setup_logger, CleanFormatter, ConsoleWriter
+├── logger.rs               -> tracing-subscriber stack: rolling file + forest console
+├── formatter.rs            -> console formatting + pipe writer
+├── console.rs              -> detached console window over a named pipe
+└── debug_console.rs        -> attach_debug_console (--debug)
+shared/                     -> cross-cutting helpers used by more than one feature
+├── elevation.rs            -> is_running_as_admin, restart_as_admin (ShellExecuteW "runas")
+├── system_theme.rs         -> is_light_theme
+└── text.rs                 -> truncate
 ```
 
 ## Config
@@ -86,6 +119,8 @@ utils.rs                    -> clean_button_name, truncate, is_system_class, is_
 - `hotkey_left_vk` / `hotkey_left_modifiers`, `hotkey_right_vk` / `hotkey_right_modifiers` (default Alt+`[` / Alt+`]`)
 - `desktop_indicator: bool` (default true)
 - `indicator_position: u8` (0=Auto, 1=Left, 2=Right; serde default 0 so old configs keep parsing)
+- `indicator_accent_color: bool` (default true; paints the dots with `HKCU\Software\Microsoft\Windows\DWM\AccentColor` (ABGR DWORD), falling back to the theme color when that value is absent)
+- `indicator_background: bool` (default true; draws a translucent rounded pill behind the dot row)
 - `jump_desktop_modifiers: u32` (default Alt)
 
 **Invariant:** in `load()`, if `cycle_taskbar_based` is true then `uncombine_mode` is forced to true.
@@ -108,7 +143,7 @@ utils.rs                    -> clean_button_name, truncate, is_system_class, is_
 
 - `TaskbarEnumerator::enumerate_buttons()` catches `EVENT_E_ALL_SUBSCRIBERS_FAILED (0x80040201)` and auto-recovers via `refresh_taskbar_hwnd()` - re-finds Shell_TrayWnd, re-subscribes UIA hooks, invalidates explorer PID cache.
 
-### Matching strategies (button_window.rs)
+### Matching strategies (taskbar/button_window.rs)
 
 Button-to-window matching tries 4 strategies in order:
 
@@ -149,11 +184,13 @@ Button-to-window matching tries 4 strategies in order:
 
 ### Custom window messages
 
+All IDs are defined in `app/messages.rs`; the event hooks and the Settings UI import them from there.
+
 - `WM_APP_UNCOMBINE = WM_USER + 0x100` - uncombine a new window (posted to the main thread)
 - `WM_APP_INVALIDATE_CACHE = WM_USER + 0x101` - invalidate button cache (posted to the main thread)
 - `WM_APP_RELOAD_CONFIG = WM_USER + 0x102` - signal background process to reload configuration (posted to hidden window `WinGlideTray`)
 - `WM_APP_RESTART_AS_ADMIN = WM_USER + 0x103` - signal to restart app with admin privileges (posted to hidden window)
-- `WM_USER_TRAYICON = WM_USER + 0x200` - tray icon callback message (in app.rs)
+- `WM_USER_TRAYICON = WM_USER + 0x200` - tray icon callback message
 
 ### Single-instance & IPC
 
@@ -170,5 +207,9 @@ Button-to-window matching tries 4 strategies in order:
 - `switch_desktop` + `WindowContext::current_state()` are used to re-activate a window on the target desktop after switching (`App::handle_hotkey` -> `SwitchVirtualDesktop`).
 - `IndicatorWindow` is an owned layered window of `Shell_TrayWnd`; it gets cloaked by DWM when Task View (`Win+Tab`) opens - known limitation.
 - **Move window to desktop via indicator**: right-clicking a desktop dot opens a menu for exactly that dot's desktop N, with the window title in a disabled header and two short items: "Move to Desktop N" (move only) and "Move and jump to Desktop N" (move + switch + re-activate); the move-only item is grayed when the window is already on that desktop. The target window is captured before the menu temporarily drops `WS_EX_NOACTIVATE` (stored in `MOVE_TARGET_HWND` + `MOVE_TARGET_INDEX`); `force_activate` hands focus back to the app window after the menu closes, and the indicator's own class (`TaskbarSwitcherIndicator`) is filtered out of move targets so it can never be chosen as the window to move. `Alt`+click a dot is the move+jump keyboard shortcut. Requires the `transmute` of the HWND into winvd's `windows`-0.58 type. Pinned (all-desktops) windows are ignored.
-- **Indicator placement** (`AppConfig.indicator_position`: 0 Auto / 1 Left / 2 Right): in **Auto** the indicator stays clear of the system tray when the taskbar is Left-aligned (`HKCU\\...\\Explorer\\Advanced\\TaskbarAl` = 0) by anchoring just left of `TrayNotifyWnd`, otherwise it sits at the left edge. **Left**/**Right** pin it to a fixed side (Right anchors just left of the tray). Changed from the Settings GUI (Desktop Indicator -> Position), applied on `WM_APP_RELOAD_CONFIG` via `IndicatorWindow::set_position`. Position is decided at render time (no polling).
+- **Indicator placement** (`AppConfig.indicator_position`: 0 Auto / 1 Left / 2 Right): in **Auto** the indicator stays clear of the system tray when the taskbar is Left-aligned (`HKCU\\...\\Explorer\\Advanced\\TaskbarAl` = 0) by anchoring just left of `TrayNotifyWnd`, otherwise it sits at the left edge. **Left**/**Right** pin it to a fixed side (Right anchors just left of / above the tray). Changed from the Settings GUI (Desktop Indicator -> Position / Accent Color / Background), applied on `WM_APP_RELOAD_CONFIG` via `IndicatorWindow::set_config(IndicatorSettings)`. Position is decided at render time (no polling).
+- **Indicator inset invariant**: on a vertical taskbar the offset along the bar is computed from the indicator's *height* (`IndicatorGeometry::physical_size().1`), **not** from its length along the dots. In label mode the dots form a horizontal row, so the height is `cross` while `length` is the row width; using `length` would push the `Right` anchor far above the tray.
+- **Label-mode row**: a vertical taskbar showing labels gets a compact horizontal dot row, so `IndicatorGeometry` separates the dot *size reference* (`scale`, a standard taskbar thickness) from the window's short dimension (`cross`, = `compact_row_height(scale)` = the pill height). `Right` keeps the usual `INDICATOR_MARGIN` from the tray.
+- **Dot color** (`AppConfig.indicator_accent_color`): when on, `DotPainter` colors the dots with the Windows accent color (`shared::system_theme::accent_color()`, read from `HKCU\\...\\DWM\\AccentColor`), deepened by `ACTIVE_DEEPEN` (0.8) for the active dot; when off, or when the accent can't be read, it falls back to the theme-neutral color (near-black on light, white on dark). Inactive dots are desaturated (`desaturate`, 0.6) so the accent marks the current desktop instead of tinting the whole row.
+- **Indicator background** (`AppConfig.indicator_background`): draws a translucent rounded pill (neutral theme color, alpha 0.25) behind the whole dot row. Its height is `PILL_HEIGHT_RATIO * scale` (0.5 => 24px at 100% DPI) in **every** layout, and the hover highlight uses the same half-height, so hovering can never spill outside the pill. Along the row the pill is the dot row plus `BACKGROUND_ALONG_MARGIN` on each side and `BACKGROUND_GROW_ALONG` of growth; the window reserves `BACKGROUND_ROOM_ALONG` so it is never clipped. The window's invisible hit-box still spans the full row either way.
 - Hotkey auto-repeat protection

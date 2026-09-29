@@ -17,22 +17,26 @@ use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use super::messages::{
+    WM_APP_INVALIDATE_CACHE, WM_APP_RELOAD_CONFIG, WM_APP_RESTART_AS_ADMIN, WM_APP_UNCOMBINE,
+    WM_USER_TRAYICON,
+};
 use crate::config::AppConfig;
 use crate::event::{self, InvalidateSource};
 use crate::hotkey::{HotkeyAction, HotkeyManager, LowLevelKeyHook};
 use crate::logging::console::{self, CONSOLE_VISIBLE};
 use crate::setting;
+use crate::shared::elevation::restart_as_admin;
 use crate::taskbar::{CycleDirection, TaskbarEnumerator, UncombineManager};
-use crate::tray_icon::{TrayIcon, IDM_EXIT, IDM_SETTINGS, IDM_SHOW_CONSOLE};
-use crate::virtual_desktop::indicator::{IndicatorPosition, IndicatorWindow};
-use crate::win32::window_context::WindowContext;
+use crate::tray::{TrayIcon, IDM_EXIT, IDM_SETTINGS, IDM_SHOW_CONSOLE};
+use crate::virtual_desktop::indicator::{IndicatorSettings, IndicatorWindow};
+use crate::window::activate::force_activate;
+use crate::window::context::WindowContext;
+use crate::window::enumerate::find_visible_windows;
 
 /// Dynamic Windows message identifier "TaskbarCreated".
 /// This message is sent when the Explorer process restarts.
 static mut WM_TASKBARCREATED: u32 = 0;
-
-/// Constant identifier for the message the system tray sends to the hidden window.
-const WM_USER_TRAYICON: u32 = WM_USER + 0x200;
 
 /// Represents the entire state of the WinGlide application.
 ///
@@ -137,8 +141,8 @@ impl App {
 
         let indicator_window = if config.desktop_indicator {
             unsafe {
-                Some(IndicatorWindow::new(IndicatorPosition::from_u8(
-                    config.indicator_position,
+                Some(IndicatorWindow::new(IndicatorSettings::from_config(
+                    config,
                 ))?)
             }
         } else {
@@ -223,9 +227,9 @@ impl App {
     fn dispatch_thread_message(&mut self, msg: &MSG) {
         match msg.message {
             WM_HOTKEY => self.handle_hotkey(msg.wParam),
-            event::WM_APP_UNCOMBINE => self.handle_uncombine(msg.wParam),
-            event::WM_APP_INVALIDATE_CACHE => self.handle_cache_invalidate(msg.wParam),
-            event::WM_APP_RELOAD_CONFIG => self.handle_reload_config(),
+            WM_APP_UNCOMBINE => self.handle_uncombine(msg.wParam),
+            WM_APP_INVALIDATE_CACHE => self.handle_cache_invalidate(msg.wParam),
+            WM_APP_RELOAD_CONFIG => self.handle_reload_config(),
             _ => {}
         }
     }
@@ -250,13 +254,13 @@ impl App {
                 }
                 Some(LRESULT(0))
             }
-            event::WM_APP_RELOAD_CONFIG => {
+            WM_APP_RELOAD_CONFIG => {
                 self.handle_reload_config();
                 Some(LRESULT(0))
             }
-            event::WM_APP_RESTART_AS_ADMIN => {
+            WM_APP_RESTART_AS_ADMIN => {
                 let reopen_ui = wparam.0 == 1;
-                let _ = crate::admin::restart_as_admin(reopen_ui);
+                let _ = restart_as_admin(reopen_ui);
                 unsafe { windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0) };
                 Some(LRESULT(0))
             }
@@ -409,7 +413,7 @@ impl App {
 impl App {
     fn handle_reload_config(&mut self) {
         info!("Reloading configuration...");
-        let config = crate::config::AppConfig::load();
+        let config = AppConfig::load();
 
         self.uncombine_enabled
             .store(config.uncombine_mode, Ordering::SeqCst);
@@ -426,12 +430,12 @@ impl App {
         self.key_hook
             .set_hotkeys(&self.hotkey_manager.low_level_hotkeys());
 
-        let position = IndicatorPosition::from_u8(config.indicator_position);
         if config.desktop_indicator {
+            let settings = IndicatorSettings::from_config(&config);
             match &mut self.indicator_window {
-                Some(ind) => ind.set_position(position),
+                Some(ind) => ind.set_config(settings),
                 None => unsafe {
-                    match IndicatorWindow::new(position) {
+                    match IndicatorWindow::new(settings) {
                         Ok(mut ind) => {
                             ind.run();
                             self.indicator_window = Some(ind);
@@ -481,8 +485,7 @@ impl App {
 
                     let current_context = WindowContext::current_state();
                     if let Some(current_desktop) = current_context.virtual_desktop {
-                        let windows =
-                            crate::win32::window::find_visible_windows(Some(&current_context));
+                        let windows = find_visible_windows(Some(&current_context));
 
                         for win in windows {
                             let winvd_hwnd = unsafe { std::mem::transmute(win.hwnd) };
@@ -490,7 +493,7 @@ impl App {
                             if let Ok(win_desktop) = winvd::get_desktop_by_window(winvd_hwnd) {
                                 if win_desktop == current_desktop {
                                     unsafe {
-                                        crate::win32::activate::force_activate(win.hwnd);
+                                        force_activate(win.hwnd);
                                     }
                                     break;
                                 }

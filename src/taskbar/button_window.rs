@@ -5,11 +5,10 @@ use std::collections::{HashMap, HashSet};
 use tracing::{debug, error, instrument};
 use windows::Win32::Foundation::HWND;
 
-use crate::win32::explorer;
-use crate::{
-    types::{TaskbarButton, WindowInfo},
-    utils,
-};
+use super::explorer_process;
+use super::utils;
+use super::TaskbarButton;
+use crate::window::WindowInfo;
 
 /// Mapping between taskbar buttons and visible windows.
 ///
@@ -227,7 +226,7 @@ impl<'a> ButtonWindowMap<'a> {
     ///
     /// Relies on the process ID if the taskbar button does not belong to explorer.exe.
     fn match_by_pid(&self, button: &TaskbarButton) -> Option<Vec<WindowInfo>> {
-        let explorer_pid = explorer::get_explorer_pid();
+        let explorer_pid = explorer_process::get_explorer_pid();
         if button.process_id == 0 || button.process_id == explorer_pid as i32 {
             return None;
         }
