@@ -21,6 +21,7 @@ mod indicator_geometry;
 mod indicator_position;
 mod indicator_settings;
 mod indicator_window;
+mod taskbar_watcher;
 mod utils;
 
 pub use indicator_settings::IndicatorSettings;
@@ -30,6 +31,9 @@ use windows::Win32::UI::WindowsAndMessaging::WM_USER;
 
 /// Posted to the indicator window when the active virtual desktop changes.
 const WM_APP_VD_EVENT: u32 = WM_USER + 0x100;
+
+/// Posted to the indicator window when the taskbar changes position (slide hide/unhide).
+const WM_APP_TASKBAR_MOVED: u32 = WM_USER + 0x101;
 
 /// Gap kept between the indicator and the taskbar edge / system tray.
 const INDICATOR_MARGIN: i32 = 6;

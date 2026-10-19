@@ -16,8 +16,9 @@ use super::desktop_mover::{DesktopMover, MoveTarget};
 use super::dot_painter::DotPainter;
 use super::indicator_geometry::{hovered_dot, IndicatorGeometry};
 use super::indicator_settings::IndicatorSettings;
+use super::taskbar_watcher::TaskbarWatcher;
 use super::utils;
-use super::{MENU_MOVE_BASE, WM_APP_VD_EVENT};
+use super::{MENU_MOVE_BASE, WM_APP_TASKBAR_MOVED, WM_APP_VD_EVENT};
 use crate::taskbar::Taskbar;
 
 /// Indicator window displaying virtual-desktop status on the taskbar.
@@ -30,6 +31,7 @@ pub struct IndicatorWindow {
     /// `GWLP_USERDATA` stays valid when this struct is moved.
     inner: Box<State>,
     _desktop_event_thread: Option<winvd::DesktopEventThread>,
+    _taskbar_watcher: Option<TaskbarWatcher>,
 }
 
 /// Mutable window state, borrowed shared-only by the message handler.
@@ -42,6 +44,10 @@ struct State {
     hover: Cell<Option<usize>>,
     move_mode: Cell<bool>,
     move_target: Cell<Option<MoveTarget>>,
+    /// Tracks whether the indicator is currently hidden due to taskbar autohide.
+    taskbar_hidden: Cell<bool>,
+    /// Last known taskbar rect, to avoid redundant re-renders when the bar has not moved.
+    last_taskbar_rect: Cell<Option<RECT>>,
 }
 
 impl IndicatorWindow {
@@ -71,11 +77,18 @@ impl IndicatorWindow {
         let (window_width, window_height) = geometry.physical_size();
         let (window_x, window_y) = geometry.origin(&taskbar, settings.position);
 
+        let is_initially_hidden = taskbar.is_hidden();
+        let initial_visibility = if is_initially_hidden {
+            WS_POPUP
+        } else {
+            WS_POPUP | WS_VISIBLE
+        };
+
         let hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class_name,
             w!("Indicator"),
-            WS_POPUP | WS_VISIBLE,
+            initial_visibility,
             window_x,
             window_y,
             window_width,
@@ -86,19 +99,24 @@ impl IndicatorWindow {
             None,
         )?;
 
-        let mut inner = Box::new(State::new(settings));
+        let mut inner = Box::new(State::new(settings, is_initially_hidden));
         SetWindowLongPtrW(
             hwnd,
             GWLP_USERDATA,
             Box::as_mut(&mut inner) as *mut State as isize,
         );
 
+        let taskbar_watcher = TaskbarWatcher::new(hwnd, taskbar.hwnd());
+
         let this = Self {
             hwnd,
             inner,
             _desktop_event_thread: None,
+            _taskbar_watcher: taskbar_watcher,
         };
-        this.inner.render(hwnd);
+        if !is_initially_hidden {
+            this.inner.render(hwnd);
+        }
 
         Ok(this)
     }
@@ -112,6 +130,11 @@ impl IndicatorWindow {
     /// Re-renders the indicator, recomputing its position against the current
     /// taskbar / system tray bounds.
     pub fn refresh(&self) {
+        if let Some(taskbar) = Taskbar::primary() {
+            if let Some(watcher) = &self._taskbar_watcher {
+                watcher.update_taskbar(self.hwnd, taskbar.hwnd());
+            }
+        }
         self.inner.render(self.hwnd);
     }
 
@@ -155,11 +178,17 @@ impl IndicatorWindow {
         };
 
         match (msg, state) {
+            (WM_APP_TASKBAR_MOVED, Some(s)) => {
+                TaskbarWatcher::reset_pending();
+                s.sync_taskbar(hwnd);
+                LRESULT(0)
+            }
             (WM_APP_VD_EVENT, Some(s)) => {
                 s.render(hwnd);
                 LRESULT(0)
             }
-            (WM_DISPLAYCHANGE | WM_SETTINGCHANGE, _) => {
+            (WM_DISPLAYCHANGE | WM_SETTINGCHANGE, Some(s)) => {
+                s.sync_taskbar(hwnd);
                 // Post instead of rendering inline: leaves any "Input Sync Call"
                 // first, so the re-render sees the latest display state.
                 let _ = PostMessageW(Some(hwnd), WM_APP_VD_EVENT, WPARAM(0), LPARAM(0));
@@ -196,12 +225,45 @@ impl Drop for IndicatorWindow {
 }
 
 impl State {
-    fn new(settings: IndicatorSettings) -> Self {
+    fn new(settings: IndicatorSettings, initially_hidden: bool) -> Self {
         Self {
             settings: Cell::new(settings),
             hover: Cell::new(None),
             move_mode: Cell::new(false),
             move_target: Cell::new(None),
+            taskbar_hidden: Cell::new(initially_hidden),
+            last_taskbar_rect: Cell::new(None),
+        }
+    }
+
+    /// Syncs indicator visibility and position against current taskbar state.
+    ///
+    /// If the taskbar is auto-hidden off-screen, the indicator hides (`SW_HIDE`).
+    /// When the taskbar reappears or moves, the indicator shows (`SW_SHOWNOACTIVATE`)
+    /// and updates its position.
+    fn sync_taskbar(&self, hwnd: HWND) {
+        unsafe {
+            let Some(taskbar) = Taskbar::primary() else {
+                if !self.taskbar_hidden.get() {
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                    self.taskbar_hidden.set(true);
+                }
+                return;
+            };
+
+            let is_hidden = taskbar.is_hidden();
+            let rect = taskbar.rect();
+            let was_hidden = self.taskbar_hidden.get();
+            let last_rect = self.last_taskbar_rect.get();
+
+            if is_hidden {
+                if !was_hidden {
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                    self.taskbar_hidden.set(true);
+                }
+            } else if was_hidden || Some(rect) != last_rect {
+                self.render(hwnd);
+            }
         }
     }
 
@@ -210,8 +272,19 @@ impl State {
     fn render(&self, hwnd: HWND) {
         unsafe {
             let Some(taskbar) = Taskbar::primary() else {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                self.taskbar_hidden.set(true);
                 return;
             };
+
+            if taskbar.is_hidden() {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                self.taskbar_hidden.set(true);
+                return;
+            }
+
+            self.last_taskbar_rect.set(Some(taskbar.rect()));
+
             let Some(geometry) = IndicatorGeometry::for_taskbar(&taskbar) else {
                 return;
             };
@@ -284,6 +357,11 @@ impl State {
                     ULW_ALPHA,
                 );
 
+                if self.taskbar_hidden.get() {
+                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                    self.taskbar_hidden.set(false);
+                }
+
                 SelectObject(mem_dc, old_bmp);
                 let _ = DeleteObject(HGDIOBJ(bmp.0 as _));
             }
@@ -294,6 +372,9 @@ impl State {
     }
 
     fn on_mouse_move(&self, hwnd: HWND, x: i32, y: i32) -> LRESULT {
+        if self.taskbar_hidden.get() {
+            return LRESULT(0);
+        }
         let hovered = hovered_dot(x, y);
         let mode_changed = self.update_move_mode();
         if self.hover.get() != hovered || mode_changed {

@@ -6,12 +6,17 @@
 
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Shell::{
     SHAppBarMessage, ABE_LEFT, ABE_RIGHT, ABE_TOP, ABM_GETTASKBARPOS, APPBARDATA,
 };
-use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, FindWindowW, GetWindowRect};
+use windows::Win32::UI::WindowsAndMessaging::{
+    FindWindowExW, FindWindowW, GetWindowRect, IsWindowVisible,
+};
 
 /// Standard thickness (px) of an icons-only taskbar at 96 DPI. A vertical
 /// taskbar whose width is much larger than this is showing button labels.
@@ -81,6 +86,55 @@ impl Taskbar {
     /// Thickness of an icons-only taskbar at this taskbar's DPI.
     pub fn icon_scale(&self) -> i32 {
         (ICON_TASKBAR_THICKNESS * self.dpi() as i32) / 96
+    }
+
+    /// Returns the monitor bounds enclosing this taskbar.
+    pub fn monitor_rect(&self) -> Option<RECT> {
+        unsafe {
+            let hmon = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
+            if hmon.is_invalid() {
+                return None;
+            }
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if GetMonitorInfoW(hmon, &mut mi).as_bool() {
+                Some(mi.rcMonitor)
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Visible thickness (px) of the taskbar inside the monitor area.
+    ///
+    /// When auto-hide is active and the bar slides off screen, only a thin sliver
+    /// (1-4px) remains within the screen bounds.
+    pub fn visible_thickness(&self) -> i32 {
+        let Some(mon) = self.monitor_rect() else {
+            return self.thickness();
+        };
+        let visible_width =
+            (self.rect.right.min(mon.right) - self.rect.left.max(mon.left)).max(0);
+        let visible_height =
+            (self.rect.bottom.min(mon.bottom) - self.rect.top.max(mon.top)).max(0);
+        if self.edge.is_vertical() {
+            visible_width
+        } else {
+            visible_height
+        }
+    }
+
+    /// True if the taskbar is currently auto-hidden (slid off-screen) or not visible.
+    pub fn is_hidden(&self) -> bool {
+        if !unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
+            return true;
+        }
+        // Normal taskbar thickness is at least ~40px at 100% DPI.
+        // When auto-hidden, only 2-4px trigger area remains visible on-screen.
+        let min_visible = (self.icon_scale() / 2).max(10);
+        self.visible_thickness() < min_visible
     }
 
     /// True when a vertical taskbar is wide enough to be showing button labels.
