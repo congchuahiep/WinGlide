@@ -94,7 +94,8 @@ impl TaskbarWatcher {
                 };
 
                 *hook_guard = new_hook;
-                self.taskbar_hwnd.store(new_taskbar_hwnd.0 as isize, Ordering::SeqCst);
+                self.taskbar_hwnd
+                    .store(new_taskbar_hwnd.0 as isize, Ordering::SeqCst);
                 debug!("TaskbarWatcher hook updated for new PID {}", pid);
             }
         }
@@ -148,7 +149,17 @@ unsafe extern "system" fn taskbar_location_proc(
     if !SYNC_PENDING.swap(true, Ordering::SeqCst) {
         let ind = INDICATOR_HWND.load(Ordering::Relaxed);
         if ind != 0 {
-            let _ = PostMessageW(Some(HWND(ind as _)), WM_APP_TASKBAR_MOVED, WPARAM(0), LPARAM(0));
+            tracing::debug!(
+                "Shell_TrayWnd LOCATIONCHANGE – event_time={}ms",
+                _event_time
+            );
+
+            let _ = PostMessageW(
+                Some(HWND(ind as _)),
+                WM_APP_TASKBAR_MOVED,
+                WPARAM(0),
+                LPARAM(0),
+            );
         }
     }
 }
