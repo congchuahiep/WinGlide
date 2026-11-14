@@ -23,9 +23,32 @@ cargo run -- --debug --verbose     # run with debug console + verbose logging
 ./target/release/WinGlide.exe            # normal run
 ./target/release/WinGlide.exe -v         # with debug logging
 ./target/release/WinGlide.exe --settings-ui   # only open the Settings GUI
+cd tools/icons && bun install && bun run gen   # regenerate the .ico assets from the SVG sources
 ```
 
 No lint/formatter config exists in the repo - only `cargo check` / `cargo build` are available.
+
+### Icon assets
+
+`assets/tray-light.ico`, `assets/tray-dark.ico` and `assets/app.ico` are generated
+by `tools/icons/gen.ts` and committed, so building the app never needs Bun. Each
+tray ICO holds seven entries (16/20/24/28/32/40/48 px); `TrayIcon` parses the
+ICOs directory itself and hands the shell an HICON that already matches the
+taskbar's DPI, instead of letting Windows downscale one large bitmap (the
+`LookupIconIdFromDirectoryEx` helper returns the first entry for in-memory ICO
+data, so it is deliberately not used). `TrayIcon::resync` rebuilds the icon when
+the taskbar DPI or the system theme changes - it runs on `WM_SETTINGCHANGE`,
+`WM_DPICHANGED`, `WM_DISPLAYCHANGE`, `WM_THEMECHANGED` and after
+`TaskbarCreated`, and no-ops when nothing relevant changed. Sizes tuned by hand
+live in `assets/overrides/tray-<size>.png`; the rest are rasterized from
+`assets/tray-icon.svg`. The dark variant keeps the alpha channel and paints it
+white, so only one set of source files exists.
+
+`assets/app.ico` holds ten entries (16..256) and is the icon Windows shows for the
+exe itself. `build.rs` embeds it plus the VERSIONINFO block through `winresource`;
+the resource script deliberately adds no manifest, because `windows-reactor-setup`
+already links the WinRT SxS manifest via `/MANIFESTINPUT` and Windows rejects a
+second one.
 
 ## CLI args (manual parsing in `cli/args.rs`, no clap)
 
@@ -90,7 +113,7 @@ virtual_desktop/
                               (IndicatorSettings mirrors the config; also DotPainter / IndicatorGeometry / Canvas / DesktopMover)
 tray/
 ├── mod.rs                  -> re-export: TrayIcon, IDM_EXIT, IDM_SETTINGS, IDM_SHOW_CONSOLE
-└── tray_icon.rs            -> Shell_NotifyIconW tray icon + context menu (Exit / Settings / Debug Console)
+└── tray_icon.rs          -> Shell_NotifyIconW tray icon + DPI-aware HICON selection + context menu
 setting/
 ├── mod.rs                  -> re-export: settings_window (run, show_ui)
 ├── settings_window.rs      -> windows-reactor native GUI + IPC to the background app

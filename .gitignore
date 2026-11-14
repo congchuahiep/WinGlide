@@ -3,5 +3,6 @@
 /dist
 dist/
 /docs
+/tools/icons/node_modules
 
 windhawk_mod.cpp

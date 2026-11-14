@@ -1,0 +1,16 @@
+{
+  "name": "winglide-icons",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "gen": "bun gen.ts"
+  },
+  "dependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "pngjs": "^7.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "@types/pngjs": "^6.0.5"
+  }
+}

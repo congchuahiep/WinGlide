@@ -60,6 +60,7 @@ features = [
 ]
 
 [build-dependencies]
+winresource = "0.1"
 windows-reactor-setup = {
   git = "https://github.com/microsoft/windows-rs",
   branch = "master"
