@@ -16,14 +16,18 @@
 //! The dark tray variant reuses the alpha channel of the same artwork and paints
 //! it white, so one set of source files serves both taskbar themes.
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Resvg } from "@resvg/resvg-js";
 import { PNG } from "pngjs";
 
 const ASSETS = join(import.meta.dir, "..", "..", "assets");
+const MSIX_ASSETS = join(import.meta.dir, "..", "..", "packaging", "Assets");
 const TRAY_SIZES = [16, 20, 24, 28, 32, 40, 48];
 const APP_SIZES = [16, 20, 24, 32, 40, 48, 64, 96, 128, 256];
+/// Sizes Windows asks for on its own, resolved by the `targetsize-<n>` suffix in the
+/// file name. These are drawn edge to edge, unlike the plated tiles below.
+const MSIX_TARGET_SIZES = [16, 20, 24, 30, 32, 36, 40, 44, 48, 60, 64, 80, 96, 256];
 
 interface RgbaImage {
 	width: number;
@@ -40,6 +44,30 @@ interface IconEntry {
 function decodePng(buffer: Buffer): RgbaImage {
 	const png = PNG.sync.read(buffer);
 	return { width: png.width, height: png.height, data: png.data };
+}
+
+function encodePng(image: RgbaImage): Buffer {
+	const png = new PNG({ width: image.width, height: image.height });
+	image.data.copy(png.data);
+	return PNG.sync.write(png);
+}
+
+/// Centres `inner` on a transparent canvas of the requested tile size.
+function placeOnTile(inner: RgbaImage, width: number, height: number): RgbaImage {
+	const data = Buffer.alloc(width * height * 4);
+	const offsetX = Math.floor((width - inner.width) / 2);
+	const offsetY = Math.floor((height - inner.height) / 2);
+	for (let y = 0; y < inner.height; y++) {
+		for (let x = 0; x < inner.width; x++) {
+			const src = (y * inner.width + x) * 4;
+			const dst = ((offsetY + y) * width + offsetX + x) * 4;
+			data[dst] = inner.data[src];
+			data[dst + 1] = inner.data[src + 1];
+			data[dst + 2] = inner.data[src + 2];
+			data[dst + 3] = inner.data[src + 3];
+		}
+	}
+	return { width, height, data };
 }
 
 function renderPng(svg: string, size: number): Buffer {
@@ -168,3 +196,42 @@ writeFileSync(join(ASSETS, "app.ico"), ico(appEntries));
 
 console.log(`tray icons written:\n${trayReport.join("\n")}`);
 console.log(`app icon written:\n${appReport.join("\n")}`);
+
+// --- MSIX package assets ----------------------------------------------------
+//
+// The manifest points at plated tiles (Square44x44Logo, Square150x150Logo,
+// Wide310x150Logo, StoreLogo, SplashScreen) and Windows resolves extra sizes on its
+// own from `*.targetsize-<n>.png`. Target sizes are drawn edge to edge and reuse the
+// app icon art, so hand-tuned overrides apply there; the plated tiles centre the
+// artwork with breathing room.
+
+mkdirSync(MSIX_ASSETS, { recursive: true });
+const msixReport: string[] = [];
+
+function writeTile(name: string, width: number, height: number, inner: number): void {
+	const icon = decodePng(renderPng(appSvg, inner));
+	const tile = placeOnTile(icon, width, height);
+	writeFileSync(join(MSIX_ASSETS, name), encodePng(tile));
+	msixReport.push(`  ${name.padEnd(36)} ${width}x${height} (icon ${inner}px)`);
+}
+
+writeTile("Square44x44Logo.png", 44, 44, 38);
+writeTile("Square150x150Logo.png", 150, 150, 105);
+writeTile("Wide310x150Logo.png", 310, 150, 104);
+writeTile("StoreLogo.png", 50, 50, 43);
+writeTile("SplashScreen.png", 620, 300, 160);
+
+for (const size of MSIX_TARGET_SIZES) {
+	const { png, source } = sourcePng(appSvg, "app", size);
+	writeFileSync(join(MSIX_ASSETS, `Square44x44Logo.targetsize-${size}.png`), png);
+	// Taskbar and Start draw the logo without a plate only when an `altform-unplated`
+	// variant exists; without it Windows paints a square in the manifest's
+	// BackgroundColor (transparent lets it pick a colour from the logo).
+	writeFileSync(join(MSIX_ASSETS, `Square44x44Logo.targetsize-${size}_altform-unplated.png`), png);
+	writeFileSync(join(MSIX_ASSETS, `Square44x44Logo.targetsize-${size}_altform-lightunplated.png`), png);
+	msixReport.push(
+		`  Square44x44Logo.targetsize-${String(size).padEnd(3)} ${size}x${size} (${source})`,
+	);
+}
+
+console.log(`msix assets written:\n${msixReport.join("\n")}`);
