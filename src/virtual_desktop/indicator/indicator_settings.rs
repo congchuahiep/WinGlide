@@ -1,7 +1,7 @@
 //! The indicator's user-facing settings, mirrored from [`AppConfig`].
 
 use super::indicator_position::IndicatorPosition;
-use crate::config::AppConfig;
+use crate::app_setting::AppConfig;
 
 /// Visual settings of the desktop indicator.
 ///

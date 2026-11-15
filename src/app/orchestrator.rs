@@ -18,15 +18,14 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::messages::{
-    WM_APP_INVALIDATE_CACHE, WM_APP_RELOAD_CONFIG, WM_APP_RESTART_AS_ADMIN, WM_APP_UNCOMBINE,
+    WM_APP_INVALIDATE_CACHE, WM_APP_RELOAD_CONFIG, WM_APP_UNCOMBINE,
     WM_USER_TRAYICON,
 };
-use crate::config::AppConfig;
+use crate::app_setting::AppConfig;
 use crate::event::{self, InvalidateSource};
 use crate::hotkey::{HotkeyAction, HotkeyManager, LowLevelKeyHook};
 use crate::logging::console::{self, CONSOLE_VISIBLE};
-use crate::setting;
-use crate::shared::elevation::restart_as_admin;
+use crate::app_setting;
 use crate::taskbar::{CycleDirection, TaskbarEnumerator, UncombineManager};
 use crate::tray::{TrayIcon, IDM_EXIT, IDM_SETTINGS, IDM_SHOW_CONSOLE};
 use crate::virtual_desktop::indicator::{IndicatorSettings, IndicatorWindow};
@@ -271,12 +270,6 @@ impl App {
                 self.handle_reload_config();
                 Some(LRESULT(0))
             }
-            WM_APP_RESTART_AS_ADMIN => {
-                let reopen_ui = wparam.0 == 1;
-                let _ = restart_as_admin(reopen_ui);
-                unsafe { windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0) };
-                Some(LRESULT(0))
-            }
             // Commands sent from the system tray context menu
             WM_COMMAND => {
                 let id = loword(wparam.0 as u32);
@@ -293,7 +286,7 @@ impl App {
                     }
                     IDM_SETTINGS => {
                         info!("Opening settings UI");
-                        setting::show_ui();
+                        app_setting::show_ui();
                     }
                     _ => {}
                 }

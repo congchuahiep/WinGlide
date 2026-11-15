@@ -1,13 +1,12 @@
 //! The main Settings window: builds the layout from the feature sections
-//! (taskbar, virtual desktop, system, updates) and drives config persistence.
+//! (taskbar, virtual desktop, system) and drives config persistence.
 //!
-//! Also owns the two IPC helpers that poke the background app
-//! (`--reload-config` / `--restart-as-admin` messages) and the process job
-//! object that ties the UI process to the background one.
+//! Also owns the IPC helper that pokes the background app to reload its config
+//! and the process job object that ties the UI process to the background one.
 
-use crate::config::AppConfig;
-use crate::setting::hotkey_button;
-use crate::setting::setting_item::{setting_item, SettingItemProps};
+use crate::app_setting::AppConfig;
+use crate::app_setting::hotkey_button;
+use crate::app_setting::setting_item::{setting_item, SettingItemProps};
 use std::os::windows::io::AsRawHandle;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::JobObjects::{
@@ -40,37 +39,23 @@ fn send_reload_signal() {
     }
 }
 
-fn send_restart_admin_signal() {
-    unsafe {
-        if let Ok(hwnd) = windows::Win32::UI::WindowsAndMessaging::FindWindowW(
-            windows::core::w!("WinGlideTray"),
-            windows::core::PCWSTR::null(),
-        ) {
-            if !hwnd.is_invalid() {
-                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                    Some(hwnd),
-                    crate::app::messages::WM_APP_RESTART_AS_ADMIN,
-                    windows::Win32::Foundation::WPARAM(1),
-                    windows::Win32::Foundation::LPARAM(0),
-                );
-            }
-        }
-    }
-}
-
 /// Main frame of the Settings App.
 /// Consists of a flow (`vstack`) containing all content blocks, padded evenly around.
 pub fn settings_app(cx: &mut RenderCx) -> Element {
-    let content = vstack((
+    let mut sections: Vec<Element> = vec![
         header(),
         taskbar_settings(cx),
         virtual_desktop_settings(cx),
         system_settings(cx),
-        update_settings(cx),
-        footer(),
-    ))
-    .spacing(32.0)
-    .margin(24.0);
+    ];
+    // The Microsoft Store build compiles the updater out entirely: Windows updates
+    // the package, and offering a GitHub download inside a Store app is against
+    // Store policy.
+    #[cfg(feature = "updater")]
+    sections.push(update_settings(cx));
+    sections.push(footer());
+
+    let content = vstack(sections).spacing(32.0).margin(24.0);
 
     scroll_viewer(content).into()
 }
@@ -108,7 +93,7 @@ fn taskbar_settings(cx: &mut RenderCx) -> Element {
                         .on_changed({
                             let set_config = set_config.clone();
                             move |is_on: bool| {
-                                let mut new_config = crate::config::AppConfig::load();
+                                let mut new_config = crate::app_setting::AppConfig::load();
                                 if new_config.uncombine_mode == is_on { return; }
                                 new_config.uncombine_mode = is_on;
                                 new_config.save();
@@ -136,7 +121,7 @@ fn taskbar_settings(cx: &mut RenderCx) -> Element {
                         .on_changed({
                             let set_config = set_config.clone();
                             move |is_on: bool| {
-                                let mut new_config = crate::config::AppConfig::load();
+                                let mut new_config = crate::app_setting::AppConfig::load();
                                 if new_config.cycle_taskbar_based == is_on { return; }
                                 new_config.cycle_taskbar_based = is_on;
                                 if is_on {
@@ -246,7 +231,7 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
         std::rc::Rc::new(move |mod_flag: u32, is_checked: bool| {
             // Load fresh config: native controls can keep a stale handler after
             // re-renders, so never compute from captured state.
-            let mut new_config = crate::config::AppConfig::load();
+            let mut new_config = crate::app_setting::AppConfig::load();
             if is_checked {
                 new_config.jump_desktop_modifiers |= mod_flag;
             } else {
@@ -304,7 +289,7 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
                 // re-renders (items unchanged => reactor skips rewiring), so
                 // relying on captured state makes re-selecting the initial
                 // value a no-op.
-                let mut new_config = crate::config::AppConfig::load();
+                let mut new_config = crate::app_setting::AppConfig::load();
                 if new_pos == new_config.indicator_position {
                     return;
                 }
@@ -328,7 +313,7 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
         .on_changed({
             let set_config = set_config.clone();
             move |checked| {
-                let mut new_config = crate::config::AppConfig::load();
+                let mut new_config = crate::app_setting::AppConfig::load();
                 new_config.indicator_accent_color = checked;
                 new_config.save();
                 set_config.call(new_config);
@@ -345,7 +330,7 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
         .on_changed({
             let set_config = set_config.clone();
             move |checked| {
-                let mut new_config = crate::config::AppConfig::load();
+                let mut new_config = crate::app_setting::AppConfig::load();
                 new_config.indicator_background = checked;
                 new_config.save();
                 set_config.call(new_config);
@@ -373,7 +358,7 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
                         .on_changed({
                             let set_config = set_config.clone();
                             move |checked| {
-                                let mut new_config = crate::config::AppConfig::load();
+                                let mut new_config = crate::app_setting::AppConfig::load();
                                 new_config.desktop_indicator = checked;
                                 new_config.save();
                                 set_config.call(new_config);
@@ -443,7 +428,7 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
 
 fn system_settings(cx: &mut RenderCx) -> Element {
     let (autostart, set_autostart) =
-        cx.use_state(crate::setting::autostart::is_autostart_enabled());
+        cx.use_state(crate::app::autostart::is_autostart_enabled());
 
     vstack((
         body_strong("System").margin(Thickness {
@@ -463,8 +448,12 @@ fn system_settings(cx: &mut RenderCx) -> Element {
                         .width(42.)
                         .on_changed({
                             move |checked| {
-                                if crate::setting::autostart::set_autostart(checked).is_ok() {
-                                    set_autostart.call(checked);
+                                match crate::app::autostart::set_autostart(checked) {
+                                    Ok(()) => set_autostart.call(checked),
+                                    // Windows can refuse (a packaged app the user
+                                    // disabled in Task Manager); say so in the log
+                                    // instead of showing a toggle that does nothing.
+                                    Err(e) => tracing::warn!("autostart: {e}"),
                                 }
                             }
                         })
@@ -476,38 +465,16 @@ fn system_settings(cx: &mut RenderCx) -> Element {
             },
             cx,
         ),
-        setting_item(
-            &SettingItemProps {
-                icon: Some('\u{E7EF}'),
-                title: Some("Administrator Privileges".into()),
-                description: Some(if crate::shared::elevation::is_running_as_admin() {
-                    "Running as Administrator. All features are available.".into()
-                } else {
-                    "Restart as Administrator to interact with elevated windows.".into()
-                }),
-                action: Some(if crate::shared::elevation::is_running_as_admin() {
-                    button("Elevated").enabled(false).into()
-                } else {
-                    button("Restart")
-                        .on_click(|| {
-                            send_restart_admin_signal();
-                        })
-                        .into()
-                }),
-                children: None,
-                always_expand: false,
-                enabled: true,
-            },
-            cx,
-        ),
     ))
     .spacing(4.0)
     .into()
 }
 
+/// Section containing the update check. Compiled out of the Store build.
+#[cfg(feature = "updater")]
 fn update_settings(cx: &mut RenderCx) -> Element {
     let (update_info, set_update_info) =
-        cx.use_async_state::<Option<crate::setting::update_checker::UpdateInfo>>(None);
+        cx.use_async_state::<Option<crate::app::update_checker::UpdateInfo>>(None);
     let (checking, set_checking) = cx.use_async_state(false);
 
     vstack((
@@ -526,17 +493,13 @@ fn update_settings(cx: &mut RenderCx) -> Element {
                 } else {
                     format!("Current version: {}", env!("CARGO_PKG_VERSION"))
                 }),
-                action: Some(if let Some(_info) = update_info.as_ref() {
+                action: Some(if update_info.is_some() {
                     button("Update Now")
-                        .on_click(move || unsafe {
-                            ShellExecuteW(
-                                None,
-                                w!("open"),
-                                w!("https://github.com/congchuahiep/WinGlide/releases/latest"),
-                                None,
-                                None,
-                                SW_SHOWNORMAL,
+                        .on_click(|| unsafe {
+                            let releases = windows::core::HSTRING::from(
+                                crate::app::update_checker::RELEASES_URL,
                             );
+                            ShellExecuteW(None, w!("open"), &releases, None, None, SW_SHOWNORMAL);
                         })
                         .into()
                 } else {
@@ -551,7 +514,7 @@ fn update_settings(cx: &mut RenderCx) -> Element {
                                 let set_update_info_clone = set_update_info.clone();
                                 std::thread::spawn(move || {
                                     if let Ok(Some(info)) =
-                                        crate::setting::update_checker::check_for_updates()
+                                        crate::app::update_checker::check_for_updates()
                                     {
                                         set_update_info_clone.call(Some(info));
                                     }
@@ -595,6 +558,9 @@ fn footer() -> Element {
 
 /// Runs the settings UI application. Only run it in the main thread.
 pub fn run() -> Result<()> {
+    // WinUI 3 windows do not inherit the executable's icon; give the title bar one.
+    super::window_icon::apply();
+
     // let _bootstrap_handle = bootstrap::initialize()?;
 
     App::new()

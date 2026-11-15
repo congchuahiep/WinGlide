@@ -104,7 +104,7 @@ impl HotkeyManager {
     /// # Errors
     /// Returns an error if it fails to register one or more hotkeys (usually due to a conflict with
     /// another software).
-    pub fn new(config: &crate::config::AppConfig) -> anyhow::Result<Self> {
+    pub fn new(config: &crate::app_setting::AppConfig) -> anyhow::Result<Self> {
         let mut hotkeys = vec![];
 
         if config.cycle_taskbar_based {
@@ -186,7 +186,7 @@ impl HotkeyManager {
     }
 
     /// Reloads the hotkey configuration: unregisters old ones, loads new ones, and registers them again.
-    pub fn reload(&mut self, config: &crate::config::AppConfig) -> anyhow::Result<()> {
+    pub fn reload(&mut self, config: &crate::app_setting::AppConfig) -> anyhow::Result<()> {
         for hotkey in &self.hotkeys {
             hotkey.unregister();
         }
