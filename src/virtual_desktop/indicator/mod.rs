@@ -1,7 +1,9 @@
 //! On-taskbar indicator for virtual desktops.
 //!
-//! The indicator is a layered popup owned by `Shell_TrayWnd` that paints one dot
-//! per virtual desktop and handles mouse input to switch desktops or move windows.
+//! The indicator is a layered **child window of `Shell_TrayWnd`** that paints one
+//! dot per virtual desktop and handles mouse input to switch desktops or move
+//! windows. Being a child keeps it in the taskbar's own z-order band, so it stays
+//! visible over the taskbar's XAML content - including while Task View is open.
 //!
 //! This file is only the module's table of contents. The behaviour lives in files
 //! named after their primary type:

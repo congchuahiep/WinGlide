@@ -323,10 +323,26 @@ impl App {
                 if let Err(e) = self.tray_icon.reregister() {
                     error!("TrayIcon reregister: {e}");
                 }
-                // The tray re-grew after our icon was re-added; re-sync the
-                // indicator so it stays clear of the tray.
-                if let Some(ind) = &self.indicator_window {
-                    ind.refresh();
+                // The indicator is a child of the old taskbar window, so Explorer
+                // restarting leaves it either destroyed or parented to a window
+                // that no longer exists. Re-attach the survivor, rebuild the rest.
+                if let Some(ind) = self.indicator_window.take() {
+                    if ind.is_alive() {
+                        ind.refresh();
+                        self.indicator_window = Some(ind);
+                    } else {
+                        drop(ind);
+                        unsafe {
+                            let settings = IndicatorSettings::from_config(&AppConfig::load());
+                            match IndicatorWindow::new(settings) {
+                                Ok(mut rebuilt) => {
+                                    rebuilt.run();
+                                    self.indicator_window = Some(rebuilt);
+                                }
+                                Err(e) => error!("Failed to recreate IndicatorWindow: {e}"),
+                            }
+                        }
+                    }
                 }
                 Some(LRESULT(0))
             }
@@ -336,6 +352,11 @@ impl App {
             // can move the notification area after the message has already been delivered.
             WM_SETTINGCHANGE | WM_DPICHANGED | WM_DISPLAYCHANGE | WM_THEMECHANGED => {
                 self.schedule_tray_resync(msg);
+                // The indicator is a child of the taskbar, so it no longer
+                // receives these broadcasts itself; repaint it from here.
+                if let Some(ind) = &self.indicator_window {
+                    ind.refresh();
+                }
                 Some(LRESULT(0))
             }
 

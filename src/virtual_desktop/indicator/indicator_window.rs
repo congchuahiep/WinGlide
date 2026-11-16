@@ -3,10 +3,14 @@
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::slice::from_raw_parts_mut;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use windows::core::w;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse;
 use windows::Win32::UI::WindowsAndMessaging::{self, *};
@@ -21,17 +25,29 @@ use super::utils;
 use super::{MENU_MOVE_BASE, WM_APP_TASKBAR_MOVED, WM_APP_VD_EVENT};
 use crate::taskbar::Taskbar;
 
+/// Timer id for the periodic "am I still above the taskbar's other children" check.
+const TIMER_Z_ORDER: usize = 1;
+/// How often that check runs. It is a single `GetWindow` call and only acts when
+/// Explorer re-stacked the taskbar's children.
+const Z_ORDER_CHECK_MS: u32 = 1500;
+
 /// Indicator window displaying virtual-desktop status on the taskbar.
 ///
 /// It uses [`WS_EX_LAYERED`] with [`UpdateLayeredWindow`] to draw 32-bit graphics
 /// with an alpha (transparent) channel.
+///
+/// The Win32 window lives on its own thread (see [`run_indicator_thread`]); this
+/// handle only posts messages to it. That is deliberate: a child of the taskbar
+/// shares the shell's input queue, so Explorer sends it messages and waits for
+/// the answer. The main thread regularly blocks inside UI Automation calls into
+/// Explorer, and answering from there would deadlock both threads.
 pub struct IndicatorWindow {
+    /// The indicator window, owned by the indicator thread.
     pub hwnd: HWND,
-    /// State shared with the static `window_proc`; boxed so the address stored in
-    /// `GWLP_USERDATA` stays valid when this struct is moved.
-    inner: Box<State>,
+    /// Settings shared with the indicator thread.
+    settings: Arc<Mutex<IndicatorSettings>>,
+    thread: Option<JoinHandle<()>>,
     _desktop_event_thread: Option<winvd::DesktopEventThread>,
-    _taskbar_watcher: Option<TaskbarWatcher>,
 }
 
 /// Mutable window state, borrowed shared-only by the message handler.
@@ -40,7 +56,7 @@ pub struct IndicatorWindow {
 /// message loop inside `TrackPopupMenu` — can never alias a `&mut`.
 struct State {
     /// Visual options from config (placement, accent color, background).
-    settings: Cell<IndicatorSettings>,
+    settings: Arc<Mutex<IndicatorSettings>>,
     hover: Cell<Option<usize>>,
     move_mode: Cell<bool>,
     move_target: Cell<Option<MoveTarget>>,
@@ -48,94 +64,85 @@ struct State {
     taskbar_hidden: Cell<bool>,
     /// Last known taskbar rect, to avoid redundant re-renders when the bar has not moved.
     last_taskbar_rect: Cell<Option<RECT>>,
+    /// Hidden top-level window that owns the right-click menu (see
+    /// [`DesktopMover::create_menu_host`]).
+    menu_host: HWND,
+    /// Watches the taskbar for auto-hide slides and Explorer restarts.
+    watcher: Option<TaskbarWatcher>,
 }
 
 impl IndicatorWindow {
     /// Initializes a new Indicator window.
     ///
-    /// **WARN: Task View Issue (Win+Tab)**
-    /// This window is an owned window of `Shell_TrayWnd` so it stays above the
-    /// taskbar. On Windows 11 the DWM "cloaks" all owned windows of the taskbar
-    /// while Task View is open, so the indicator temporarily disappears. Known
-    /// limitation, no complete workaround yet.
+    /// The window is a **child of `Shell_TrayWnd`**, not a popup owned by it.
+    /// Windows keeps a child inside its parent's z-order band, so the dots stay
+    /// above the taskbar's own XAML content for as long as the bar exists - also
+    /// while Task View (`Win+Tab`) covers every ordinary window. [`State::render`]
+    /// keeps it at `HWND_TOP` among the taskbar's children, because
+    /// `Windows.UI.Composition.DesktopWindowContentBridge` is a full-size
+    /// sibling that would otherwise paint over the dots.
     pub unsafe fn new(settings: IndicatorSettings) -> anyhow::Result<Self> {
-        let hinstance = GetModuleHandleW(None)?;
-        let class_name = w!("TaskbarSwitcherIndicator");
-
-        let wnd_class = WNDCLASSW {
-            hInstance: HINSTANCE(hinstance.0),
-            lpszClassName: class_name,
-            lpfnWndProc: Some(Self::window_proc),
-            ..Default::default()
-        };
-        let _ = RegisterClassW(&wnd_class);
-
-        let taskbar =
-            Taskbar::primary().ok_or_else(|| anyhow::anyhow!("primary taskbar is unavailable"))?;
-        let geometry = IndicatorGeometry::for_taskbar(&taskbar)
-            .ok_or_else(|| anyhow::anyhow!("taskbar geometry is unavailable"))?;
-        let (window_width, window_height) = geometry.physical_size();
-        let (window_x, window_y) = geometry.origin(&taskbar, settings.position);
-
-        let is_initially_hidden = taskbar.is_hidden();
-        let initial_visibility = if is_initially_hidden {
-            WS_POPUP
-        } else {
-            WS_POPUP | WS_VISIBLE
-        };
-
-        let hwnd = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            class_name,
-            w!("Indicator"),
-            initial_visibility,
-            window_x,
-            window_y,
-            window_width,
-            window_height,
-            Some(taskbar.hwnd()),
-            None,
-            Some(hinstance.into()),
-            None,
-        )?;
-
-        let mut inner = Box::new(State::new(settings, is_initially_hidden));
-        SetWindowLongPtrW(
-            hwnd,
-            GWLP_USERDATA,
-            Box::as_mut(&mut inner) as *mut State as isize,
-        );
-
-        let taskbar_watcher = TaskbarWatcher::new(hwnd, taskbar.hwnd());
-
-        let this = Self {
-            hwnd,
-            inner,
-            _desktop_event_thread: None,
-            _taskbar_watcher: taskbar_watcher,
-        };
-        if !is_initially_hidden {
-            this.inner.render(hwnd);
+        // Fail fast (and with the same error as before) instead of spawning a
+        // thread that would only report the missing taskbar back.
+        if Taskbar::primary().is_none() {
+            anyhow::bail!("primary taskbar is unavailable");
         }
 
-        Ok(this)
+        let settings = Arc::new(Mutex::new(settings));
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<isize, String>>();
+        let thread_settings = Arc::clone(&settings);
+        let thread = std::thread::Builder::new()
+            .name("indicator".into())
+            .spawn(move || unsafe { run_indicator_thread(thread_settings, ready_tx) })?;
+
+        let hwnd = match ready_rx.recv() {
+            Ok(Ok(handle)) => HWND(handle as *mut _),
+            Ok(Err(e)) => {
+                let _ = thread.join();
+                anyhow::bail!("indicator window: {e}");
+            }
+            Err(e) => {
+                let _ = thread.join();
+                anyhow::bail!("indicator thread stopped: {e}");
+            }
+        };
+
+        Ok(Self {
+            hwnd,
+            settings,
+            thread: Some(thread),
+            _desktop_event_thread: None,
+        })
     }
 
     /// Applies the indicator settings and re-renders the indicator.
     pub fn set_config(&mut self, settings: IndicatorSettings) {
-        self.inner.settings.set(settings);
-        self.inner.render(self.hwnd);
+        if let Ok(mut shared) = self.settings.lock() {
+            *shared = settings;
+        }
+        unsafe {
+            let _ = PostMessageW(Some(self.hwnd), WM_APP_VD_EVENT, WPARAM(0), LPARAM(0));
+        }
     }
 
     /// Re-renders the indicator, recomputing its position against the current
     /// taskbar / system tray bounds.
+    ///
+    /// `WM_APP_TASKBAR_MOVED` re-syncs the taskbar snapshot (including a new
+    /// HWND after an Explorer restart) and then draws.
     pub fn refresh(&self) {
-        if let Some(taskbar) = Taskbar::primary() {
-            if let Some(watcher) = &self._taskbar_watcher {
-                watcher.update_taskbar(self.hwnd, taskbar.hwnd());
-            }
+        unsafe {
+            let _ = PostMessageW(Some(self.hwnd), WM_APP_TASKBAR_MOVED, WPARAM(0), LPARAM(0));
         }
-        self.inner.render(self.hwnd);
+    }
+
+    /// Whether the underlying window still exists.
+    ///
+    /// A child window can be destroyed together with its parent, so an Explorer
+    /// restart may leave `self.hwnd` dangling; callers rebuild the indicator in
+    /// that case instead of drawing into a dead window.
+    pub fn is_alive(&self) -> bool {
+        unsafe { IsWindow(Some(self.hwnd)).as_bool() }
     }
 
     /// Starts a thread that watches virtual-desktop switches and posts
@@ -181,6 +188,11 @@ impl IndicatorWindow {
             (WM_APP_TASKBAR_MOVED, Some(s)) => {
                 TaskbarWatcher::reset_pending();
                 s.sync_taskbar(hwnd);
+                // `refresh()` reuses this message for theme/DPI changes, where
+                // the taskbar did not move but the dots still need a repaint.
+                if !s.taskbar_hidden.get() {
+                    s.render(hwnd);
+                }
                 LRESULT(0)
             }
             (WM_APP_VD_EVENT, Some(s)) => {
@@ -205,9 +217,36 @@ impl IndicatorWindow {
             }
             (WM_RBUTTONUP, Some(s)) => {
                 let (x, y) = lparam_point(lparam);
-                s.on_rbutton_up(hwnd, x, y)
+                s.on_rbutton_up(x, y)
             }
             (WM_COMMAND, Some(s)) => s.on_command(wparam),
+            (WM_TIMER, Some(s)) if wparam.0 == TIMER_Z_ORDER => {
+                s.keep_on_top(hwnd);
+                LRESULT(0)
+            }
+            // The message loop of the indicator thread exits here; the owning
+            // `IndicatorWindow` is then joined by its `Drop`.
+            (WM_DESTROY, _) => {
+                PostQuitMessage(0);
+                LRESULT(0)
+            }
+            // UI Automation asking for this window's accessibility object. Answer
+            // "nothing": accessibility clients (WinGlide's own taskbar walk
+            // included) would otherwise make a synchronous cross-process call
+            // into this thread, which can freeze the shell while the thread is
+            // busy. FluentFlyout, which also lives on the taskbar, does the same.
+            (WM_GETOBJECT, _) => LRESULT(0),
+            // The indicator is a child of the shell's window, so a plain click
+            // would activate the taskbar. Keep the click without taking focus.
+            (WM_MOUSEACTIVATE, _) => {
+                // Still before the click clears the foreground window.
+                DesktopMover::capture_foreground();
+                LRESULT(MA_NOACTIVATE as isize)
+            }
+            // A right-click on a child window that leaves WM_CONTEXTMENU to
+            // `DefWindowProc` gets it forwarded to the parent, so the shell opens
+            // its taskbar menu on top of ours. Handle the right-click ourselves.
+            (WM_CONTEXTMENU, _) => LRESULT(0),
             (WindowsAndMessaging::WM_SETCURSOR, _) => set_move_cursor(),
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
@@ -216,31 +255,154 @@ impl IndicatorWindow {
 
 impl Drop for IndicatorWindow {
     fn drop(&mut self) {
-        unsafe {
-            // Detach state first so messages sent during destruction skip it.
-            SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
-            let _ = DestroyWindow(self.hwnd);
+        // The window belongs to the indicator thread. Ask it to close
+        // (DefWindowProc destroys the window, WM_DESTROY quits the loop) and
+        // wait for that thread to drop the window state.
+        let _ = unsafe { PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
 
+impl Drop for State {
+    fn drop(&mut self) {
+        DesktopMover::destroy_menu_host(self.menu_host);
+    }
+}
+
+/// Entry point of the thread that owns the indicator window.
+///
+/// A child of the taskbar shares the shell's input queue: Explorer sends it
+/// messages (accessibility queries, show/hide notifications) and waits for the
+/// answer. The main thread regularly blocks inside UI Automation calls into
+/// Explorer, so answering from there deadlocks the taskbar. This thread only
+/// pumps messages and paints, so it always answers.
+unsafe fn run_indicator_thread(
+    settings: Arc<Mutex<IndicatorSettings>>,
+    ready: mpsc::Sender<Result<isize, String>>,
+) {
+    // winvd (virtual desktop queries) needs an STA on the thread that uses it.
+    let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+
+    match create_indicator_window(settings) {
+        Ok((hwnd, state)) => {
+            let _ = ready.send(Ok(hwnd.0 as isize));
+            run_message_loop();
+            // Drops the menu owner window and unhooks the taskbar watcher.
+            drop(state);
+        }
+        Err(e) => {
+            let _ = ready.send(Err(e.to_string()));
+        }
+    }
+
+    CoUninitialize();
+}
+
+/// Creates the window, its hidden menu owner and the taskbar watcher on the
+/// indicator thread.
+unsafe fn create_indicator_window(
+    settings: Arc<Mutex<IndicatorSettings>>,
+) -> anyhow::Result<(HWND, Box<State>)> {
+    let hinstance = GetModuleHandleW(None)?;
+    let class_name = w!("TaskbarSwitcherIndicator");
+
+    let wnd_class = WNDCLASSW {
+        hInstance: HINSTANCE(hinstance.0),
+        lpszClassName: class_name,
+        lpfnWndProc: Some(IndicatorWindow::window_proc),
+        ..Default::default()
+    };
+    let _ = RegisterClassW(&wnd_class);
+
+    let taskbar =
+        Taskbar::primary().ok_or_else(|| anyhow::anyhow!("primary taskbar is unavailable"))?;
+    let geometry = IndicatorGeometry::for_taskbar(&taskbar)
+        .ok_or_else(|| anyhow::anyhow!("taskbar geometry is unavailable"))?;
+    let (window_width, window_height) = geometry.physical_size();
+
+    // Created hidden as a popup, then turned into a child right away: the window
+    // must not appear while it is still a top-level popup. `render` shows it once
+    // it sits in the taskbar's client area.
+    //
+    // `WS_EX_NOPARENTNOTIFY` keeps the shell from receiving create/click
+    // notifications for a foreign child window that it never expected.
+    let hwnd = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOPARENTNOTIFY,
+        class_name,
+        w!("Indicator"),
+        WS_POPUP,
+        0,
+        0,
+        window_width,
+        window_height,
+        None,
+        None,
+        Some(hinstance.into()),
+        None,
+    )?;
+    reparent_to_taskbar(hwnd, taskbar.hwnd());
+
+    // Safety net for shell re-layouts: if Explorer ever puts its XAML content
+    // bridge back above the dots, the next tick restores the order.
+    SetTimer(Some(hwnd), TIMER_Z_ORDER, Z_ORDER_CHECK_MS, None);
+
+    let menu_host = DesktopMover::create_menu_host(hwnd);
+    let watcher = TaskbarWatcher::new(hwnd, taskbar.hwnd());
+    let mut state = Box::new(State::new(
+        settings,
+        taskbar.is_hidden(),
+        menu_host,
+        watcher,
+    ));
+    SetWindowLongPtrW(
+        hwnd,
+        GWLP_USERDATA,
+        Box::as_mut(&mut state) as *mut State as isize,
+    );
+
+    if !state.taskbar_hidden.get() {
+        state.render(hwnd);
+    }
+
+    Ok((hwnd, state))
+}
+
+/// Runs the indicator thread's message loop until the window is destroyed.
+unsafe fn run_message_loop() {
+    let mut msg = std::mem::zeroed();
+    while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+        let _ = TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+
 impl State {
-    fn new(settings: IndicatorSettings, initially_hidden: bool) -> Self {
+    fn new(
+        settings: Arc<Mutex<IndicatorSettings>>,
+        initially_hidden: bool,
+        menu_host: HWND,
+        watcher: Option<TaskbarWatcher>,
+    ) -> Self {
         Self {
-            settings: Cell::new(settings),
+            settings,
             hover: Cell::new(None),
             move_mode: Cell::new(false),
             move_target: Cell::new(None),
             taskbar_hidden: Cell::new(initially_hidden),
             last_taskbar_rect: Cell::new(None),
+            menu_host,
+            watcher,
         }
     }
 
-    /// Syncs indicator visibility and position against current taskbar state.
+    /// Syncs indicator visibility, position and parent against the current
+    /// taskbar state.
     ///
     /// If the taskbar is auto-hidden off-screen, the indicator hides (`SW_HIDE`).
-    /// When the taskbar reappears or moves, the indicator shows (`SW_SHOWNOACTIVATE`)
-    /// and updates its position.
+    /// When the taskbar reappears, moves, or was recreated by Explorer, the
+    /// indicator re-parents and draws itself again.
     fn sync_taskbar(&self, hwnd: HWND) {
         unsafe {
             let Some(taskbar) = Taskbar::primary() else {
@@ -255,15 +417,61 @@ impl State {
             let rect = taskbar.rect();
             let was_hidden = self.taskbar_hidden.get();
             let last_rect = self.last_taskbar_rect.get();
+            let reattached = self.attach(hwnd, taskbar.hwnd());
+            if let Some(watcher) = &self.watcher {
+                watcher.update_taskbar(hwnd, taskbar.hwnd());
+            }
 
             if is_hidden {
                 if !was_hidden {
                     let _ = ShowWindow(hwnd, SW_HIDE);
                     self.taskbar_hidden.set(true);
                 }
-            } else if was_hidden || Some(rect) != last_rect {
+            } else if was_hidden || reattached || Some(rect) != last_rect {
                 self.render(hwnd);
             }
+        }
+    }
+
+    /// Re-parents the indicator to `taskbar_hwnd` when it is not a child of it
+    /// yet (Explorer recreated the taskbar). A child follows its parent, so a
+    /// stale parent means the dots would move or vanish with a window that no
+    /// longer exists.
+    ///
+    /// Returns `true` when the parent changed.
+    fn attach(&self, hwnd: HWND, taskbar_hwnd: HWND) -> bool {
+        unsafe {
+            if let Ok(parent) = GetParent(hwnd) {
+                if parent == taskbar_hwnd {
+                    return false;
+                }
+            }
+            let _ = SetParent(hwnd, Some(taskbar_hwnd));
+            true
+        }
+    }
+
+    /// Puts the dots back above the taskbar's other children when something
+    /// ended up over them.
+    ///
+    /// Explorer's XAML content bridge is a full-size sibling of the indicator,
+    /// and a shell re-layout can raise it again. The check is one `GetWindow`
+    /// call and does nothing while the order is already right.
+    fn keep_on_top(&self, hwnd: HWND) {
+        unsafe {
+            // `Err` means "no window above me", i.e. the order is already right.
+            if GetWindow(hwnd, GW_HWNDPREV).is_err() {
+                return;
+            }
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOP),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
         }
     }
 
@@ -282,6 +490,10 @@ impl State {
                 self.taskbar_hidden.set(true);
                 return;
             }
+
+            // Explorer may have restarted since the last frame; the dots must
+            // follow the *current* taskbar, not the dead one.
+            self.attach(hwnd, taskbar.hwnd());
 
             self.last_taskbar_rect.set(Some(taskbar.rect()));
 
@@ -317,7 +529,9 @@ impl State {
                     from_raw_parts_mut(ppvbits as *mut u32, (phys_width * phys_height) as usize);
                 buffer.fill(0);
 
-                let settings = self.settings.get();
+                let Ok(settings) = self.settings.lock().map(|s| *s) else {
+                    return;
+                };
                 let painter = DotPainter::new(geometry, settings.accent_color, settings.background);
                 let mut canvas =
                     Canvas::new(buffer, phys_width, phys_height, geometry.dots_vertical());
@@ -328,15 +542,28 @@ impl State {
                     move_modifier_down(),
                 );
 
-                let (window_x, window_y) = geometry.origin(&taskbar, settings.position);
+                let (screen_x, screen_y) = geometry.origin(&taskbar, settings.position);
+                let (client_x, client_y) = client_point(taskbar.hwnd(), screen_x, screen_y);
+
+                // Position inside the taskbar and stay on top of its children:
+                // Explorer's XAML content bridge spans the whole bar and would
+                // otherwise paint over the dots. Showing the window before the
+                // first paint is harmless - a layered window has no surface yet,
+                // so it stays fully transparent until `UpdateLayeredWindow` runs.
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOP),
+                    client_x,
+                    client_y,
+                    phys_width,
+                    phys_height,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+
                 let mut pt_src = POINT { x: 0, y: 0 };
                 let mut size = SIZE {
                     cx: phys_width,
                     cy: phys_height,
-                };
-                let mut pt_dst = POINT {
-                    x: window_x,
-                    y: window_y,
                 };
                 let mut blend = BLENDFUNCTION {
                     BlendOp: AC_SRC_OVER as u8,
@@ -345,10 +572,12 @@ impl State {
                     AlphaFormat: AC_SRC_ALPHA as u8,
                 };
 
+                // No destination point: the position comes from `SetWindowPos`
+                // above, in the parent's client coordinates.
                 let _ = UpdateLayeredWindow(
                     hwnd,
                     None,
-                    Some(&mut pt_dst as *mut _),
+                    None,
                     Some(&mut size as *mut _),
                     Some(mem_dc),
                     Some(&mut pt_src as *mut _),
@@ -357,10 +586,7 @@ impl State {
                     ULW_ALPHA,
                 );
 
-                if self.taskbar_hidden.get() {
-                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-                    self.taskbar_hidden.set(false);
-                }
+                self.taskbar_hidden.set(false);
 
                 SelectObject(mem_dc, old_bmp);
                 let _ = DeleteObject(HGDIOBJ(bmp.0 as _));
@@ -372,6 +598,9 @@ impl State {
     }
 
     fn on_mouse_move(&self, hwnd: HWND, x: i32, y: i32) -> LRESULT {
+        // Remember the window the user was working in while the pointer is still
+        // only hovering: the click itself clears the foreground window.
+        DesktopMover::capture_foreground();
         if self.taskbar_hidden.get() {
             return LRESULT(0);
         }
@@ -394,33 +623,43 @@ impl State {
     }
 
     fn on_lbutton_up(&self, x: i32, y: i32) -> LRESULT {
-        if let Some(idx) = hovered_dot(x, y) {
-            if let Ok(desktops) = winvd::get_desktops() {
-                if let Some(desktop) = desktops.get(idx) {
-                    if move_modifier_down() {
-                        // Alt + click: move the foreground window to that desktop.
-                        DesktopMover::move_foreground(desktop);
-                    } else {
-                        let _ = winvd::switch_desktop(*desktop);
-                    }
+        let dot = hovered_dot(x, y);
+        tracing::debug!("indicator left-click at ({x}, {y}) hit {dot:?}");
+        let Some(idx) = dot else {
+            // The click landed on the transparent part of the window; give the
+            // focus back to the window the user was working in.
+            DesktopMover::restore_foreground();
+            return LRESULT(0);
+        };
+        if let Ok(desktops) = winvd::get_desktops() {
+            if let Some(desktop) = desktops.get(idx) {
+                if move_modifier_down() {
+                    // Alt + click: move the foreground window to that desktop.
+                    DesktopMover::move_foreground(desktop);
+                } else {
+                    let _ = winvd::switch_desktop(*desktop);
                 }
             }
         }
         LRESULT(0)
     }
 
-    fn on_rbutton_up(&self, hwnd: HWND, x: i32, y: i32) -> LRESULT {
+    fn on_rbutton_up(&self, x: i32, y: i32) -> LRESULT {
         // The right-clicked dot tells us exactly which desktop N to act on, and
         // the target window is captured before the menu takes foreground.
-        if let Some(idx) = hovered_dot(x, y) {
-            if let Some(target_hwnd) = DesktopMover::foreground_target() {
-                let target = MoveTarget {
-                    hwnd: target_hwnd,
-                    desktop_index: idx,
-                };
-                self.move_target.set(Some(target));
-                DesktopMover::show_menu(hwnd, target);
-            }
+        let dot = hovered_dot(x, y);
+        tracing::debug!("indicator right-click at ({x}, {y}) hit {dot:?}");
+        let Some(idx) = dot else {
+            DesktopMover::restore_foreground();
+            return LRESULT(0);
+        };
+        if let Some(target_hwnd) = DesktopMover::foreground_target() {
+            let target = MoveTarget {
+                hwnd: target_hwnd,
+                desktop_index: idx,
+            };
+            self.move_target.set(Some(target));
+            DesktopMover::show_menu(self.menu_host, target);
         }
         LRESULT(0)
     }
@@ -453,6 +692,27 @@ fn move_modifier_down() -> bool {
 fn lparam_point(lparam: LPARAM) -> (i32, i32) {
     let packed = lparam.0 as i32;
     ((packed << 16) >> 16, packed >> 16)
+}
+
+/// Turns `hwnd` into a child window of `taskbar` - the indicator's whole trick.
+///
+/// `SetParent` deliberately leaves `WS_POPUP`/`WS_CHILD` alone for compatibility
+/// reasons, so the style has to be flipped by hand first. As a child, the window
+/// is clipped to the taskbar, follows it when it moves, hides with it, and is
+/// composited inside the taskbar's z-order band.
+unsafe fn reparent_to_taskbar(hwnd: HWND, taskbar: HWND) {
+    let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    let child = (style & !(WS_POPUP.0 as isize)) | WS_CHILD.0 as isize;
+    SetWindowLongPtrW(hwnd, GWL_STYLE, child);
+    let _ = SetParent(hwnd, Some(taskbar));
+}
+
+/// Converts a screen point into the client coordinates of `parent`, which is
+/// what a child window's position is expressed in.
+unsafe fn client_point(parent: HWND, x: i32, y: i32) -> (i32, i32) {
+    let mut pt = POINT { x, y };
+    let _ = ScreenToClient(parent, &mut pt);
+    (pt.x, pt.y)
 }
 
 /// Asks for a `WM_MOUSELEAVE` once the pointer leaves the indicator.

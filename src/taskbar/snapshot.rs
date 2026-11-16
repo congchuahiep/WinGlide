@@ -11,9 +11,6 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Shell::{
-    SHAppBarMessage, ABE_LEFT, ABE_RIGHT, ABE_TOP, ABM_GETTASKBARPOS, APPBARDATA,
-};
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowExW, FindWindowW, GetWindowRect, IsWindowVisible,
 };
@@ -196,32 +193,16 @@ impl Taskbar {
     }
 }
 
-/// Detects the screen edge of the primary taskbar.
+/// Detects the screen edge of the primary taskbar from its rectangle.
 ///
-/// Prefers the documented appbar API `SHAppBarMessage(ABM_GETTASKBARPOS)` and
-/// falls back to measuring the rectangle when that query fails (e.g. right after
-/// an Explorer restart). A vertical taskbar is tall and narrow, so
-/// `width < height` is a reliable fallback signal.
+/// `SHAppBarMessage(ABM_GETTASKBARPOS)` would answer the same question, but it is
+/// a synchronous call into Explorer, and the indicator runs on a thread that must
+/// never block on the shell (Explorer sends that thread messages and waits for the
+/// answer, so a blocking call the other way round deadlocks the taskbar).
+/// `Shell_TrayWnd` always sits on a screen edge, so the rectangle is enough: a
+/// vertical bar is tall and narrow, and the side with a non-positive offset is the
+/// one it slides off from.
 fn detect_edge(taskbar_rect: RECT) -> TaskbarEdge {
-    unsafe {
-        let mut abd = APPBARDATA {
-            cbSize: std::mem::size_of::<APPBARDATA>() as u32,
-            ..Default::default()
-        };
-        if SHAppBarMessage(ABM_GETTASKBARPOS, &mut abd) != 0 {
-            return if abd.uEdge == ABE_LEFT {
-                TaskbarEdge::Left
-            } else if abd.uEdge == ABE_RIGHT {
-                TaskbarEdge::Right
-            } else if abd.uEdge == ABE_TOP {
-                TaskbarEdge::Top
-            } else {
-                // ABE_BOTTOM, or any unexpected value, means bottom.
-                TaskbarEdge::Bottom
-            };
-        }
-    }
-
     let width = taskbar_rect.right - taskbar_rect.left;
     let height = taskbar_rect.bottom - taskbar_rect.top;
     if width >= height {
