@@ -24,7 +24,7 @@ bun run gen
 seven entries (16, 20, 24, 28, 32, 40, 48 px) so Windows can pick the exact size
 for the taskbar's DPI instead of downscaling a single bitmap.
 
-For each size the generator rasterizes `assets/tray-icon.svg`. The glyph sits on a 16-unit grid with 1-unit strokes, so 16/32/48 land exactly on the pixel grid while 20/24/28/40 keep anti-aliased edges — a deliberate trade to keep a single source of truth for the artwork. There are no hand-tuned tray overrides checked in at the moment; add `assets/overrides/tray-<size>.png` only when one size needs its own art.
+For each size the generator rasterizes `assets/tray-icon.svg`. The glyph sits on a 16-unit grid with 1-unit strokes, so 16/32/48 land exactly on the pixel grid while 20/24/28/40 keep anti-aliased edges. The 20 and 24 px entries are hand-tuned instead: at 125% and 150% DPI a scaled 1-unit stroke would smear into two grey rows, so `assets/overrides/tray-20.png` and `tray-24.png` draw it as one hard pixel. 16/32/48 overrides are checked in as well; 28 and 40 come straight from the SVG.
 
 ## The application icon
 
@@ -59,8 +59,8 @@ enough - Windows resolves them through `resources.pri`, which is why
 
 ## Override requirements
 
-Overrides are optional and currently unused for the tray glyph. When one is
-added:
+Overrides are checked in for the tray glyph at 16, 20, 24, 32 and 48 px (28
+and 40 px render from the SVG). When one is added:
 - Exact size in the filename and in the pixels (e.g. `tray-24.png` is 24×24);
   the generator stops with an error when they disagree, so a mistyped size cannot
   ship. Application overrides take the `app-` prefix.

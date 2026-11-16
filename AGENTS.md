@@ -42,10 +42,10 @@ taskbar's DPI, instead of letting Windows downscale one large bitmap (the
 data, so it is deliberately not used). `TrayIcon::resync` rebuilds the icon when
 the taskbar DPI or the system theme changes - it runs on `WM_SETTINGCHANGE`,
 `WM_DPICHANGED`, `WM_DISPLAYCHANGE`, `WM_THEMECHANGED` and after
-`TaskbarCreated`, and no-ops when nothing relevant changed. All seven tray sizes
-are rasterized from `assets/tray-icon.svg` (16/32/48 land exactly on its 16-unit
-grid, 20/24/28/40 keep anti-aliased edges); there are no hand-tuned tray
-overrides at the moment. The dark variant keeps the alpha channel and paints it
+`TaskbarCreated`, and no-ops when nothing relevant changed. Tray sizes are
+hand-tuned in `assets/overrides/tray-<size>.png` (16/20/24/32/48) because a
+scaled 1-unit stroke smears at 125%/150% DPI; 28 and 40 px are rasterized from
+`assets/tray-icon.svg`. The dark variant keeps the alpha channel and paints it
 white, so only one set of source files exists. `tools/icons/README.md` documents
 the size table and the override rules.
 
