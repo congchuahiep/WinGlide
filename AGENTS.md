@@ -173,6 +173,7 @@ virtual_desktop/
                               (IndicatorSettings mirrors the config; also DotPainter / IndicatorGeometry / Canvas / DesktopMover)
 tray/
 ├── mod.rs                  -> re-export: TrayIcon, IDM_EXIT, IDM_SETTINGS, IDM_SHOW_CONSOLE
+├── tray_badge.rs           -> desktop number drawn into the tray glyph's middle cell (3x5 pixel font)
 └── tray_icon.rs          -> Shell_NotifyIconW tray icon + DPI-aware HICON selection + context menu
 logging/
 ├── mod.rs                  -> re-export: setup_logger, CleanFormatter, ConsoleWriter
@@ -197,6 +198,7 @@ shared/                     -> cross-cutting helpers used by more than one featu
 - `indicator_position: u8` (0=Auto, 1=Left, 2=Right; serde default 0 so old configs keep parsing)
 - `indicator_accent_color: bool` (default true; paints the dots with `HKCU\Software\Microsoft\Windows\DWM\AccentColor` (ABGR DWORD), falling back to the theme color when that value is absent)
 - `indicator_background: bool` (default true; draws a translucent rounded pill behind the dot row)
+- `indicator_mode: u8` (default 0; 0 = dots on the taskbar, 2 = the desktop number drawn inside the tray icon; 1 is reserved for the automatic fallback, not implemented yet). Tray mode keeps the dot window hidden and repaints the tray icon on every desktop switch; `TrayIcon::set_badge` caches on `(size, theme, number)` and `tray_badge.rs` stamps the digit from a 3x5 pixel font (a hinted system font turns to mush at 16 px), so no per-number icon assets exist.
 - `jump_desktop_modifiers: u32` (default Alt)
 
 **Invariant:** in `load()`, if `cycle_taskbar_based` is true then `uncombine_mode` is forced to true.

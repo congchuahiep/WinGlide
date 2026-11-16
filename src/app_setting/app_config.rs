@@ -33,6 +33,12 @@ pub struct AppConfig {
     #[serde(default)]
     pub indicator_position: u8,
 
+    /// Where the Desktop Indicator is drawn: 0 = dots on the taskbar, 2 = the
+    /// desktop number in the notification-area icon (1 is reserved for the
+    /// automatic fallback that is not implemented yet)
+    #[serde(default)]
+    pub indicator_mode: u8,
+
     /// Paint the Desktop Indicator dots with the Windows accent color
     #[serde(default = "default_true")]
     pub indicator_accent_color: bool,
@@ -62,6 +68,7 @@ impl Default for AppConfig {
             hotkey_right_modifiers: MOD_ALT.0 as u32,
             desktop_indicator: true,
             indicator_position: 0, // Auto
+            indicator_mode: 0,     // Taskbar dots
             indicator_accent_color: true,
             indicator_background: true,
             jump_desktop_modifiers: MOD_ALT.0 as u32,

@@ -197,6 +197,7 @@ impl IndicatorWindow {
             }
             (WM_APP_VD_EVENT, Some(s)) => {
                 s.render(hwnd);
+                s.notify_desktop_changed();
                 LRESULT(0)
             }
             (WM_DISPLAYCHANGE | WM_SETTINGCHANGE, Some(s)) => {
@@ -433,6 +434,25 @@ impl State {
         }
     }
 
+    /// Tells the background app that the active desktop changed, so a tray-icon
+    /// indicator can repaint its number.
+    ///
+    /// The tray icon lives on the app's thread, so the indicator thread can only
+    /// post the new number to the hidden `WinGlideTray` window.
+    fn notify_desktop_changed(&self) {
+        unsafe {
+            let Ok(tray) = FindWindowW(w!("WinGlideTray"), windows::core::PCWSTR::null()) else {
+                return;
+            };
+            let _ = PostMessageW(
+                Some(tray),
+                crate::app::messages::WM_APP_DESKTOP_CHANGED,
+                WPARAM(super::current_desktop_number()),
+                LPARAM(0),
+            );
+        }
+    }
+
     /// Re-parents the indicator to `taskbar_hwnd` when it is not a child of it
     /// yet (Explorer recreated the taskbar). A child follows its parent, so a
     /// stale parent means the dots would move or vanish with a window that no
@@ -478,6 +498,19 @@ impl State {
     /// Renders the dots into a 32-bit ARGB bitmap and pushes it to the screen
     /// with `UpdateLayeredWindow`.
     fn render(&self, hwnd: HWND) {
+        let Ok(settings) = self.settings.lock().map(|s| *s) else {
+            return;
+        };
+        if settings.mode.is_tray() {
+            // The notification area carries the desktop number instead. Hide the
+            // dot window so it cannot sit over the taskbar's buttons.
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            self.taskbar_hidden.set(true);
+            return;
+        }
+
         unsafe {
             let Some(taskbar) = Taskbar::primary() else {
                 let _ = ShowWindow(hwnd, SW_HIDE);
@@ -529,9 +562,6 @@ impl State {
                     from_raw_parts_mut(ppvbits as *mut u32, (phys_width * phys_height) as usize);
                 buffer.fill(0);
 
-                let Ok(settings) = self.settings.lock().map(|s| *s) else {
-                    return;
-                };
                 let painter = DotPainter::new(geometry, settings.accent_color, settings.background);
                 let mut canvas =
                     Canvas::new(buffer, phys_width, phys_height, geometry.dots_vertical());

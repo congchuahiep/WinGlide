@@ -305,6 +305,36 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
         ..Default::default()
     });
 
+    // Indicator mode: dots on the taskbar, or the desktop number in the tray icon.
+    let mode_label = match config.indicator_mode {
+        2 => "Tray icon",
+        _ => "Taskbar dots",
+    };
+    let mode_action: Element = drop_down_button(mode_label)
+        .menu_flyout(vec![menu_item("Taskbar dots"), menu_item("Tray icon")])
+        .on_flyout_item_click({
+            let set_config = set_config.clone();
+            move |text: String| {
+                let new_mode = match text.as_str() {
+                    "Tray icon" => 2,
+                    _ => 0,
+                };
+                let mut new_config = crate::app_setting::AppConfig::load();
+                if new_mode == new_config.indicator_mode {
+                    return;
+                }
+                new_config.indicator_mode = new_mode;
+                new_config.save();
+                set_config.call(new_config);
+                send_reload_signal();
+            }
+        })
+        .into();
+    let mode_action = mode_action.margin(Thickness {
+        right: 10.,
+        ..Default::default()
+    });
+
     let accent_action: Element = ToggleSwitch::new(config.indicator_accent_color)
         .on_content("")
         .off_content("")
@@ -379,12 +409,22 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
                     enabled: config.desktop_indicator,
                 }, SettingItemProps {
                     icon: None,
+                    title: Some("Mode".into()),
+                    description: Some(
+                        "Draw the dots on the taskbar, or show the current desktop number in the notification area".into(),
+                    ),
+                    action: Some(mode_action.into()),
+                    children: None,
+                    always_expand: false,
+                    enabled: config.desktop_indicator,
+                }, SettingItemProps {
+                    icon: None,
                     title: Some("Position".into()),
                     description: Some("Placement of the indicator on the taskbar".into()),
                     action: Some(position_action.into()),
                     children: None,
                     always_expand: false,
-                    enabled: config.desktop_indicator,
+                    enabled: config.desktop_indicator && config.indicator_mode != 2,
                 }, SettingItemProps {
                     icon: None,
                     title: Some("Accent Color".into()),
@@ -394,7 +434,7 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
                     action: Some(accent_action),
                     children: None,
                     always_expand: false,
-                    enabled: config.desktop_indicator,
+                    enabled: config.desktop_indicator && config.indicator_mode != 2,
                 }, SettingItemProps {
                     icon: None,
                     title: Some("Background".into()),
@@ -402,7 +442,7 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
                     action: Some(background_action),
                     children: None,
                     always_expand: false,
-                    enabled: config.desktop_indicator,
+                    enabled: config.desktop_indicator && config.indicator_mode != 2,
                 }]),
                 always_expand: true,
                 enabled: true,
