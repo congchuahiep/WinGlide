@@ -1,14 +1,22 @@
-//! Handles checking for application updates via the GitHub Release API.
+//! Checks the GitHub Releases API for a newer version.
 //!
-//! This module queries the official GitHub repository for the latest release,
-//! compares the version tag against the currently compiled version, and extracts
-//! the download URL for the `.msi` installer.
+//! Only the MSI and ZIP builds use this: a package installed from the Microsoft
+//! Store is updated by the Store itself, and Store policy forbids pointing users
+//! to a download outside it. The Settings UI hides the update section when
+//! [`crate::shared::package::is_packaged`] is true, so this code never runs there.
+//!
+//! A query compares the release tag against the compiled version and, when they
+//! differ, hands back the `.msi` asset of that release.
 
 use anyhow::Result;
 use serde::Deserialize;
 use std::env;
 
 const REPO_URL: &str = "https://api.github.com/repos/congchuahiep/WinGlide/releases/latest";
+
+/// Releases page the Settings UI opens when an update exists. Derived from
+/// `Cargo.toml` so the repository URL is written down once.
+pub const RELEASES_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/latest");
 
 /// Represents the JSON structure of a GitHub Release.
 #[derive(Deserialize, Debug)]

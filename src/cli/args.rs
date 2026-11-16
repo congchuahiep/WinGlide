@@ -19,7 +19,6 @@ pub struct Args {
     pub debug: bool,
     pub verbose: bool,
     pub combine_enabled: bool,
-    pub reopen_ui: bool,
     pub mode: RunMode,
 }
 
@@ -29,7 +28,6 @@ pub fn parse_args() -> Args {
 
     args.debug = raw.iter().any(|a| a == "--debug");
     args.verbose = raw.iter().any(|a| a == "-v" || a == "--verbose");
-    args.reopen_ui = raw.iter().any(|a| a == "--reopen-ui");
 
     if raw.iter().any(|a| a == "--console-worker") {
         args.mode = RunMode::ConsoleWorker;

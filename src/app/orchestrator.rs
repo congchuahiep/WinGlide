@@ -18,15 +18,14 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::messages::{
-    WM_APP_INVALIDATE_CACHE, WM_APP_RELOAD_CONFIG, WM_APP_RESTART_AS_ADMIN, WM_APP_UNCOMBINE,
+    WM_APP_INVALIDATE_CACHE, WM_APP_RELOAD_CONFIG, WM_APP_UNCOMBINE,
     WM_USER_TRAYICON,
 };
-use crate::config::AppConfig;
+use crate::app_setting::AppConfig;
 use crate::event::{self, InvalidateSource};
 use crate::hotkey::{HotkeyAction, HotkeyManager, LowLevelKeyHook};
 use crate::logging::console::{self, CONSOLE_VISIBLE};
-use crate::setting;
-use crate::shared::elevation::restart_as_admin;
+use crate::app_setting;
 use crate::taskbar::{CycleDirection, TaskbarEnumerator, UncombineManager};
 use crate::tray::{TrayIcon, IDM_EXIT, IDM_SETTINGS, IDM_SHOW_CONSOLE};
 use crate::virtual_desktop::indicator::{IndicatorSettings, IndicatorWindow};
@@ -37,6 +36,15 @@ use crate::window::enumerate::find_visible_windows;
 /// Dynamic Windows message identifier "TaskbarCreated".
 /// This message is sent when the Explorer process restarts.
 static mut WM_TASKBARCREATED: u32 = 0;
+
+/// Timer that keeps re-checking the tray icon after a display or DPI change.
+///
+/// The shell can move the notification area to another monitor a moment after the message that
+/// announced the change, so a single check right when the message arrives can still read the old
+/// taskbar DPI and leave the icon at the wrong size.
+const TIMER_TRAY_RESYNC: usize = 1;
+const TRAY_RESYNC_TICKS: u32 = 12;
+const TRAY_RESYNC_INTERVAL_MS: u32 = 250;
 
 /// Represents the entire state of the WinGlide application.
 ///
@@ -113,6 +121,9 @@ pub struct App {
 
     /// Indicator window displaying Virtual Desktop status.
     indicator_window: Option<IndicatorWindow>,
+
+    /// Remaining [`TIMER_TRAY_RESYNC`] ticks of the post-change tray icon re-check.
+    tray_resync_ticks: u32,
 }
 
 impl App {
@@ -161,6 +172,7 @@ impl App {
             tray_icon,
             hidden_window,
             indicator_window,
+            tray_resync_ticks: 0,
         })
     }
 
@@ -258,12 +270,6 @@ impl App {
                 self.handle_reload_config();
                 Some(LRESULT(0))
             }
-            WM_APP_RESTART_AS_ADMIN => {
-                let reopen_ui = wparam.0 == 1;
-                let _ = restart_as_admin(reopen_ui);
-                unsafe { windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0) };
-                Some(LRESULT(0))
-            }
             // Commands sent from the system tray context menu
             WM_COMMAND => {
                 let id = loword(wparam.0 as u32);
@@ -280,7 +286,7 @@ impl App {
                     }
                     IDM_SETTINGS => {
                         info!("Opening settings UI");
-                        setting::show_ui();
+                        app_setting::show_ui();
                     }
                     _ => {}
                 }
@@ -311,6 +317,9 @@ impl App {
             // This occurs when the explorer.exe process restarts.
             _ if msg == unsafe { WM_TASKBARCREATED } => {
                 info!("TaskbarCreated, re-registering tray icon");
+                // The taskbar may come back on a monitor with a different DPI; rebuilding before
+                // `NIM_ADD` means the shell gets the right entry straight away.
+                self.schedule_tray_resync(msg);
                 if let Err(e) = self.tray_icon.reregister() {
                     error!("TrayIcon reregister: {e}");
                 }
@@ -322,29 +331,48 @@ impl App {
                 Some(LRESULT(0))
             }
 
-            // Update UI when the user changes light/dark mode in Windows Settings
-            WM_SETTINGCHANGE => {
-                let lparam_str = if lparam.0 != 0 {
-                    unsafe {
-                        let ptr = lparam.0 as *const u16;
-                        let mut len = 0;
-                        while *ptr.add(len) != 0 {
-                            len += 1;
-                        }
-                        String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
-                    }
-                } else {
-                    String::new()
-                };
+            // Theme, DPI or display topology changed: the tray icon may now need another size
+            // or colour. `schedule_tray_resync` re-checks for a few seconds, because the shell
+            // can move the notification area after the message has already been delivered.
+            WM_SETTINGCHANGE | WM_DPICHANGED | WM_DISPLAYCHANGE | WM_THEMECHANGED => {
+                self.schedule_tray_resync(msg);
+                Some(LRESULT(0))
+            }
 
-                if lparam_str == "ImmersiveColorSet" {
-                    self.tray_icon.update_theme();
+            WM_TIMER if wparam.0 == TIMER_TRAY_RESYNC => {
+                self.tray_icon.resync();
+                self.tray_resync_ticks = self.tray_resync_ticks.saturating_sub(1);
+                if self.tray_resync_ticks == 0 {
+                    unsafe {
+                        let _ = KillTimer(Some(self.hidden_window.hwnd), TIMER_TRAY_RESYNC);
+                    }
                 }
                 Some(LRESULT(0))
             }
 
             _ => None,
         }
+    }
+
+    /// Rebuilds the tray icon now, then keeps re-checking it on a short repeating timer.
+    ///
+    /// A display change is announced before the shell rearranges the taskbars, so the DPI read
+    /// right away can still be the old one - unplugging a 100% primary monitor while a 150%
+    /// secondary becomes the new home of the notification area is the case that exposes it. The
+    /// timer keeps `TrayIcon::resync` running for `TRAY_RESYNC_TICKS * TRAY_RESYNC_INTERVAL_MS`
+    /// milliseconds; every tick after the icon caught up is a no-op.
+    fn schedule_tray_resync(&mut self, msg: u32) {
+        self.tray_icon.resync();
+        self.tray_resync_ticks = TRAY_RESYNC_TICKS;
+        unsafe {
+            SetTimer(
+                Some(self.hidden_window.hwnd),
+                TIMER_TRAY_RESYNC,
+                TRAY_RESYNC_INTERVAL_MS,
+                None,
+            );
+        }
+        debug!("TrayIcon resync scheduled (msg=0x{msg:04X})");
     }
 }
 

@@ -8,7 +8,8 @@ Rust (edition 2021) app for **Windows 11 only**, version 0.0.9. Single binary (`
 - Uncombine taskbar buttons (unique AUMID per window)
 - On-screen virtual desktop indicator (drawn on the taskbar)
 - Jump to virtual desktop via `Alt+1`..`Alt+9`
-- System tray icon + Settings GUI + auto-update check
+- System tray icon + Settings GUI
+- Update check against GitHub Releases (MSI/ZIP builds; the Store updates the package itself)
 
 Uses IUIAutomation because the Win11 taskbar is XAML, not Win32 HWNDs.
 
@@ -23,9 +24,85 @@ cargo run -- --debug --verbose     # run with debug console + verbose logging
 ./target/release/WinGlide.exe            # normal run
 ./target/release/WinGlide.exe -v         # with debug logging
 ./target/release/WinGlide.exe --settings-ui   # only open the Settings GUI
+cd tools/icons && bun install && bun run gen   # regenerate the .ico assets from the SVG sources
+cargo build --release --no-default-features --features store   # Store flavour (no GitHub updater)
+powershell -ExecutionPolicy Bypass -File packaging/build-msix.ps1   # MSIX -> target\msix\WinGlide_<version>_x64.msix
 ```
 
 No lint/formatter config exists in the repo - only `cargo check` / `cargo build` are available.
+
+### Icon assets
+
+`assets/tray-light.ico`, `assets/tray-dark.ico` and `assets/app.ico` are generated
+by `tools/icons/gen.ts` and committed, so building the app never needs Bun. Each
+tray ICO holds seven entries (16/20/24/28/32/40/48 px); `TrayIcon` parses the
+ICOs directory itself and hands the shell an HICON that already matches the
+taskbar's DPI, instead of letting Windows downscale one large bitmap (the
+`LookupIconIdFromDirectoryEx` helper returns the first entry for in-memory ICO
+data, so it is deliberately not used). `TrayIcon::resync` rebuilds the icon when
+the taskbar DPI or the system theme changes - it runs on `WM_SETTINGCHANGE`,
+`WM_DPICHANGED`, `WM_DISPLAYCHANGE`, `WM_THEMECHANGED` and after
+`TaskbarCreated`, and no-ops when nothing relevant changed. Sizes tuned by hand
+live in `assets/overrides/tray-<size>.png`; the rest are rasterized from
+`assets/tray-icon.svg`. The dark variant keeps the alpha channel and paints it
+white, so only one set of source files exists. `tools/icons/README.md` documents
+the size table and the override rules.
+
+`assets/app.ico` holds ten entries (16..256) and is the icon Windows shows for the
+exe itself. `build.rs` embeds it plus the VERSIONINFO block through `winresource`;
+the resource script deliberately adds no manifest, because `windows-reactor-setup`
+already links the WinRT SxS manifest via `/MANIFESTINPUT` and Windows rejects a
+second one.
+
+The same generator also writes `packaging/Assets/` (47 PNGs: the plated tiles plus
+`Square44x44Logo.targetsize-<n>` in normal, `_altform-unplated` and
+`_altform-lightunplated` forms). Those are committed too, so a package build needs
+no Bun either.
+
+### MSIX packaging
+
+`packaging/` builds the Microsoft Store package; the MSI and ZIP channels are
+unchanged and `packaging/README.md` is the user-facing guide. What an agent needs
+to know:
+
+- `packaging/AppxManifest.xml` is a template - `build-msix.ps1` substitutes
+  `{{IDENTITY_NAME}}`, `{{PUBLISHER}}`, `{{PUBLISHER_DISPLAY_NAME}}` and
+  `{{VERSION}}` (from `Cargo.toml`, padded to four parts). The three identity
+  values come from `MSIX_IDENTITY_NAME` / `MSIX_PUBLISHER` /
+  `MSIX_PUBLISHER_DISPLAY_NAME` in the environment, falling back to a gitignored
+  root `.env`; `packaging/identity.example.env` is the template. They are public
+  data, but a fork must build under its own publisher.
+- The script must rewrite `resources.pri`: Windows resolves the
+  `_altform-unplated` logos through the index, so without it Start and the taskbar
+  paint a coloured plate behind the icon. Indexing the whole stage fails on
+  duplicate `Microsoft.UI.Xaml/Assets` entries, so the index is built from a
+  temporary directory containing only `Assets/` and merged into the SDK one.
+- `uap:VisualElements BackgroundColor` must be a real colour: `transparent` makes
+  Windows fill the tile with the system accent colour.
+- Runtime differences are behind `shared::package::is_packaged()`:
+  `app::autostart` uses `StartupTask::GetAsync` with the manifest's `TaskId`
+  when packaged - a packaged process writes the Run key into a private registry
+  hive the shell never reads - and the plain Run key otherwise.
+- Build-time differences are behind the `updater` / `store` Cargo features. They
+  are mutually exclusive and `default = ["updater"]`: plain `cargo build` gives
+  the MSI/ZIP flavour with the GitHub updater, `--no-default-features --features
+  store` compiles the updater and `reqwest` out for the Store package, whose
+  updates come from Windows instead. `main.rs` fails the build with a
+  `compile_error!` when neither or both are selected.
+- `release.yml` builds the package after the MSI and ZIP steps and uploads it as
+  the `WinGlide-msix` workflow artifact - never to the GitHub release, because an
+  unsigned `.msix` only installs in developer mode. The step is skipped with a
+  warning when the `MSIX_IDENTITY_*` secrets are missing.
+- `build-msix.ps1` builds into `target\msix\cargo` (`CARGO_TARGET_DIR`), so the
+  Store flavour never overwrites the MSI/ZIP build in `target\release`.
+- The package is signed by default with a self-signed certificate kept in
+  `target\msix\` - `Add-AppxPackage -Path` refuses an unsigned one with
+  `0x800B0100` - and CI passes `-NoSign` because the Store re-signs the upload.
+- `-Register` is the no-admin local loop (`Add-AppxPackage -Register` on
+  `target/msix/stage/AppxManifest.xml`, Developer Mode required). A signed install
+  additionally needs the dev certificate in `LocalMachine\TrustedPeople` -
+  `CurrentUser` does not work (`0x800B0109`). Reinstalling the same version needs
+  `Remove-AppxPackage` first (`0x80073CFB`).
 
 ## CLI args (manual parsing in `cli/args.rs`, no clap)
 
@@ -33,7 +110,6 @@ No lint/formatter config exists in the repo - only `cargo check` / `cargo build`
 - `--debug` - attach/alloc console for debug logging (also enables console worker)
 - `--console-worker` - run as standalone debug console worker process
 - `--settings-ui` - launch only the Settings GUI (XAML)
-- `--reopen-ui` - after starting the background app, reopen the Settings UI
 
 `Args.combine_enabled` field exists but is never set by any flag (dead).
 
@@ -49,15 +125,21 @@ main.rs                     -> panic hook -> dispatch: cli::parse_args -> app (s
 app/
 ├── mod.rs                  -> re-export: App, ensure_single_instance, InstanceType, setup_dpi_awareness
 ├── orchestrator.rs         -> App: wires hotkey_manager + key_hook + enumerator + uncombine_manager + tray + indicator + hidden window
-├── messages.rs             -> custom message IDs: WM_APP_UNCOMBINE/INVALIDATE_CACHE/RELOAD_CONFIG/RESTART_AS_ADMIN, WM_USER_TRAYICON
+├── autostart.rs            -> enable/disable start at login: StartupTask when packaged, HKCU\...\Run otherwise
+├── update_checker.rs       -> GitHub Releases API check (reqwest blocking); MSI/ZIP builds only
+├── messages.rs             -> custom message IDs: WM_APP_UNCOMBINE/INVALIDATE_CACHE/RELOAD_CONFIG, WM_USER_TRAYICON
 ├── single_instance.rs      -> ensure_single_instance (named mutex) + InstanceType
 └── dpi_awareness.rs        -> setup_dpi_awareness (Per-Monitor V2)
+app_setting/                -> user settings: what is stored + the window that edits it
+├── mod.rs                  -> re-export: AppConfig, run, show_ui
+├── app_config.rs           -> AppConfig: serde JSON at %APPDATA%/WinGlide/config.json (see "Config")
+├── settings_window.rs      -> windows-reactor native GUI + IPC to the background app
+├── hotkey_button.rs        -> hotkey-capture control
+├── setting_item.rs         -> reusable settings row widget
+└── window_icon.rs          -> WM_SETICON for the WinUI title bar (which ignores the exe icon)
 cli/
 ├── mod.rs                  -> re-export: parse_args, print_help, RunMode
 └── args.rs                 -> manual arg parsing (Args / RunMode: ConsoleWorker / SettingsUi / BackgroundApp)
-config/
-├── mod.rs                  -> re-export: AppConfig
-└── app_config.rs           -> AppConfig: serde JSON at %APPDATA%/WinGlide/config.json (see "Config")
 hotkey/
 ├── mod.rs                  -> re-export: HotkeyManager, HotkeyAction, LowLevelKeyHook
 ├── manager.rs              -> HotkeyManager: RegisterHotKey + dispatch classification (CycleLeft/CycleRight/SwitchVirtualDesktop)
@@ -92,14 +174,7 @@ virtual_desktop/
                               (IndicatorSettings mirrors the config; also DotPainter / IndicatorGeometry / Canvas / DesktopMover)
 tray/
 ├── mod.rs                  -> re-export: TrayIcon, IDM_EXIT, IDM_SETTINGS, IDM_SHOW_CONSOLE
-└── tray_icon.rs            -> Shell_NotifyIconW tray icon + context menu (Exit / Settings / Debug Console)
-setting/
-├── mod.rs                  -> re-export: settings_window (run, show_ui)
-├── settings_window.rs      -> windows-reactor native GUI + IPC to the background app
-├── hotkey_button.rs        -> hotkey-capture control
-├── setting_item.rs         -> reusable settings row widget
-├── autostart.rs            -> HKCU\...\Run registry autostart enable/disable
-└── update_checker.rs       -> GitHub Releases API check (reqwest blocking), finds .msi asset
+└── tray_icon.rs          -> Shell_NotifyIconW tray icon + DPI-aware HICON selection + context menu
 logging/
 ├── mod.rs                  -> re-export: setup_logger, CleanFormatter, ConsoleWriter
 ├── logger.rs               -> tracing-subscriber stack: rolling file + forest console
@@ -107,14 +182,14 @@ logging/
 ├── console.rs              -> detached console window over a named pipe
 └── debug_console.rs        -> attach_debug_console (--debug)
 shared/                     -> cross-cutting helpers used by more than one feature
-├── elevation.rs            -> is_running_as_admin, restart_as_admin (ShellExecuteW "runas")
+├── package.rs              -> is_packaged() via GetCurrentPackageFullName (MSIX vs MSI/ZIP)
 ├── system_theme.rs         -> is_light_theme
 └── text.rs                 -> truncate
 ```
 
 ## Config
 
-`AppConfig` is serialized to `%APPDATA%/WinGlide/config.json` (via `dirs::config_dir()`). Loaded at startup in `main.rs`, reloaded by `WM_APP_RELOAD_CONFIG`. Fields:
+`AppConfig` (`app_setting/app_config.rs`) is serialized to `%APPDATA%/WinGlide/config.json` (via `dirs::config_dir()`). Loaded at startup in `main.rs`, reloaded by `WM_APP_RELOAD_CONFIG`. Fields:
 
 - `uncombine_mode: bool` (default true)
 - `cycle_taskbar_based: bool` (default true)
@@ -173,11 +248,12 @@ Things that look like details but matter:
 
 ### Dependencies
 
-- `windows` 0.61 (features from `Win32_UI_Accessibility`, `Win32_UI_Shell_PropertiesSystem`, `Win32_UI_WindowsAndMessaging`, etc.)
+- `windows` 0.61 (features from `Win32_UI_Accessibility`, `Win32_UI_Shell_PropertiesSystem`, `Win32_UI_WindowsAndMessaging`, etc., plus `ApplicationModel` for the packaged startup task)
 - `windows-reactor` (git from microsoft/windows-rs master) - native GUI for the Settings UI
 - `winvd` - virtual desktop API (detect/switch desktops, DesktopEventThread)
 - `serde`/`serde_json` - config persistence
-- `reqwest` (blocking) - GitHub update check
+- `reqwest` (blocking, optional, feature `updater`) - GitHub update check; the
+  `store` build is compiled without it
 - `anyhow`, `tracing` stack, `once_cell`, `dirs`, `nu-ansi-term`
 
 ### Windows 11 only
@@ -205,7 +281,6 @@ All IDs are defined in `app/messages.rs`; the event hooks and the Settings UI im
 - `WM_APP_UNCOMBINE = WM_USER + 0x100` - uncombine a new window (posted to the main thread)
 - `WM_APP_INVALIDATE_CACHE = WM_USER + 0x101` - invalidate button cache (posted to the main thread)
 - `WM_APP_RELOAD_CONFIG = WM_USER + 0x102` - signal background process to reload configuration (posted to hidden window `WinGlideTray`)
-- `WM_APP_RESTART_AS_ADMIN = WM_USER + 0x103` - signal to restart app with admin privileges (posted to hidden window)
 - `WM_USER_TRAYICON = WM_USER + 0x200` - tray icon callback message
 
 ### Single-instance & IPC

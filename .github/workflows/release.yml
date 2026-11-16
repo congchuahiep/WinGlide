@@ -95,6 +95,36 @@ jobs:
         run: |
           Compress-Archive -Path dist\* -DestinationPath target\wix\WinGlide-Portable-x86_64.zip
 
+      # Store package. It builds in its own target directory (see build-msix.ps1), so
+      # the MSI and the ZIP above keep the flavour that carries the GitHub updater.
+      - name: Check MSIX identity secrets
+        id: msix
+        shell: pwsh
+        run: |
+          if ("${{ secrets.MSIX_IDENTITY_NAME }}" -ne "") {
+            "enabled=true" >> $env:GITHUB_OUTPUT
+          } else {
+            "enabled=false" >> $env:GITHUB_OUTPUT
+            Write-Output "::warning::MSIX_IDENTITY_NAME secret is not set - skipping the Store package"
+          }
+
+      - name: Build MSIX package
+        if: steps.msix.outputs.enabled == 'true'
+        env:
+          MSIX_IDENTITY_NAME: ${{ secrets.MSIX_IDENTITY_NAME }}
+          MSIX_PUBLISHER: ${{ secrets.MSIX_PUBLISHER }}
+          MSIX_PUBLISHER_DISPLAY_NAME: ${{ secrets.MSIX_PUBLISHER_DISPLAY_NAME }}
+        run: powershell -ExecutionPolicy Bypass -File packaging/build-msix.ps1 -NoSign
+
+      # Artifact only, not a release download: an unsigned .msix installs only in
+      # developer mode, so this file exists to be uploaded to Partner Center.
+      - name: Upload MSIX artifact
+        if: steps.msix.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinGlide-msix
+          path: target\msix\WinGlide_*_x64.msix
+
       # Stage chỉ 2 artifact cuối vào thư mục sạch (target\wix còn chứa file trung gian .wixobj/.wixpdb)
       - name: Stage artifacts for GitHub Pages
         run: |

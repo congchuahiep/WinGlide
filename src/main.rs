@@ -6,13 +6,24 @@
 
 #![windows_subsystem = "windows"]
 
+// One of the two build flavours has to be chosen explicitly; a build with
+// neither, or with both, is a mistake that would otherwise only show up as a
+// missing or forbidden update check in a release artefact.
+#[cfg(all(not(feature = "updater"), not(feature = "store")))]
+compile_error!(
+    "pick a build flavour: plain `cargo build --release` for MSI/ZIP, \
+     `--no-default-features --features store` for the Microsoft Store package"
+);
+
+#[cfg(all(feature = "updater", feature = "store"))]
+compile_error!("`updater` (MSI/ZIP) and `store` are mutually exclusive build flavours");
+
 mod app;
+mod app_setting;
 mod cli;
-mod config;
 mod event;
 mod hotkey;
 mod logging;
-mod setting;
 mod shared;
 mod taskbar;
 mod tray;
@@ -116,7 +127,7 @@ fn dispatch() -> anyhow::Result<()> {
             if app::ensure_single_instance(app::InstanceType::SettingsUI) {
                 let _guard = logging::setup_logger(args.verbose);
                 tracing::info!("Starting settings UI process");
-                setting::run()?;
+                app_setting::run()?;
             }
         }
         cli::RunMode::BackgroundApp => {
@@ -125,12 +136,8 @@ fn dispatch() -> anyhow::Result<()> {
                 let _guard = logging::setup_logger(args.verbose);
                 app::setup_dpi_awareness();
 
-                let config = config::AppConfig::load();
+                let config = app_setting::AppConfig::load();
                 let mut app = app::App::new(&config)?;
-
-                if args.reopen_ui {
-                    setting::show_ui();
-                }
 
                 unsafe {
                     app.run(windows::Win32::System::Threading::GetCurrentThreadId())?;
