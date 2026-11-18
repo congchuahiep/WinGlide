@@ -9,11 +9,13 @@
 //!
 //! Two facts make an exact model possible:
 //!
-//! 1. The taskbar's automation id is `Appid: <AUMID>`, i.e. the shell tells us which
-//!    AUMID a button represents.
-//! 2. WinGlide's uncombine feature writes `TaskbarSwitcher_<HWND>` as the AUMID of every
-//!    window it splits, so for those windows the button id contains the **window
-//!    handle** itself.
+//! 1. The taskbar's automation id identifies the represented window directly:
+//!    - `Appid: <AUMID>` for combined buttons;
+//!    - `Window: 0x<hwnd>` for a **labelled** taskbar (Windows 11 "never combine"
+//!      with labels), where the id is the exact window handle;
+//!    - `Appid: TaskbarSwitcher_<hwnd>` for windows split by the uncombine feature.
+//! 2. WinGlide's uncombine feature writes an AUMID that contains the window handle,
+//!    so those buttons are exact too.
 //!
 //! Matching is therefore: parse the id, compare AUMIDs exactly (never `contains`), and
 //! fall back to heuristics only when the button exposes no usable id. A window belongs
@@ -34,6 +36,10 @@ const AUMID_PREFIX: &str = "appid:";
 
 /// Prefix written by WinGlide's uncombine feature; the rest is the window handle.
 const UNCOMBINE_PREFIX: &str = "taskbarswitcher_";
+
+/// Prefix the shell uses on a **labelled** taskbar button (Windows 11 "never combine"
+/// with labels): `Window: 0x<hwnd>`, i.e. the exact window handle.
+const WINDOW_PREFIX: &str = "window:";
 
 /// All taskbar slots for one monitor, plus the windows they point into.
 pub(crate) struct SlotPlan {
@@ -78,21 +84,23 @@ impl SlotPlan {
         // Pass 1: exact identity. A window claimed here can never be taken by another slot.
         for (slot_index, identity) in identities.iter().enumerate() {
             match identity {
-                Identity::Hwnd(value) => {
+                Identity::Hwnd { value, source } => {
                     let hwnd = HWND(*value as *mut _);
                     let Some(window_index) = windows.iter().position(|w| w.contains(hwnd)) else {
                         debug!("Slot {slot_index}: no live window for {hwnd:?} (stale button)");
                         continue;
                     };
 
-                    let expected = format!("{UNCOMBINE_PREFIX}{value}");
-                    if !windows[window_index]
-                        .aumids()
-                        .any(|aumid| aumid.eq_ignore_ascii_case(&expected))
-                    {
-                        debug!(
-                            "Slot {slot_index}: {hwnd:?} does not read back AUMID '{expected}'"
-                        );
+                    if matches!(source, HwndSource::Uncombine) {
+                        let expected = format!("{UNCOMBINE_PREFIX}{value}");
+                        if !windows[window_index]
+                            .aumids()
+                            .any(|aumid| aumid.eq_ignore_ascii_case(&expected))
+                        {
+                            debug!(
+                                "Slot {slot_index}: {hwnd:?} does not read back AUMID '{expected}'"
+                            );
+                        }
                     }
 
                     assign(&mut slots, &mut claimed, slot_index, window_index);
@@ -176,12 +184,22 @@ fn assign(slots: &mut [Slot], claimed: &mut [bool], slot_index: usize, window_in
 /// The identity encoded in a button's `automation_id`.
 #[derive(Debug)]
 enum Identity {
-    /// `TaskbarSwitcher_<hwnd>`: exact window handle.
-    Hwnd(isize),
+    /// Exact window handle, from `TaskbarSwitcher_<hwnd>` (uncombine) or
+    /// `Window: 0x<hwnd>` (labelled taskbar button).
+    Hwnd { value: isize, source: HwndSource },
     /// Any other AUMID, lowercased.
     Aumid(String),
     /// No usable automation id; use heuristics.
     Hint,
+}
+
+/// Which form of exact handle the button exposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HwndSource {
+    /// `TaskbarSwitcher_<hwnd>` written by WinGlide's uncombine feature.
+    Uncombine,
+    /// `Window: 0x<hwnd>` from the labelled taskbar layout.
+    Window,
 }
 
 fn parse_identity(button: &TaskbarButton) -> Identity {
@@ -202,16 +220,36 @@ fn parse_identity(button: &TaskbarButton) -> Identity {
 
     if let Some(value) = aumid.strip_prefix(UNCOMBINE_PREFIX) {
         if let Ok(hwnd) = value.parse::<isize>() {
-            return Identity::Hwnd(hwnd);
+            return Identity::Hwnd {
+                value: hwnd,
+                source: HwndSource::Uncombine,
+            };
+        }
+    }
+
+    if let Some(value) = aumid.strip_prefix(WINDOW_PREFIX) {
+        if let Some(hwnd) = parse_handle(value.trim()) {
+            return Identity::Hwnd {
+                value: hwnd,
+                source: HwndSource::Window,
+            };
         }
     }
 
     Identity::Aumid(aumid.to_string())
 }
 
+/// Parses `0x<hwnd>` or a decimal handle.
+fn parse_handle(value: &str) -> Option<isize> {
+    match value.strip_prefix("0x") {
+        Some(hex) => isize::from_str_radix(hex, 16).ok(),
+        None => value.parse::<isize>().ok(),
+    }
+}
+
 fn identity_key(identity: &Identity, index: usize, name: &str) -> String {
     match identity {
-        Identity::Hwnd(value) => format!("hwnd:{value}"),
+        Identity::Hwnd { value, .. } => format!("hwnd:{value}"),
         Identity::Aumid(aumid) => format!("aumid:{aumid}"),
         Identity::Hint => format!("hint:{index}:{name}"),
     }
@@ -318,7 +356,32 @@ mod tests {
     #[test]
     fn parses_the_uncombine_identity_as_an_exact_handle() {
         match parse_identity(&button(Some("Appid: TaskbarSwitcher_2557428"))) {
-            Identity::Hwnd(value) => assert_eq!(value, 2_557_428),
+            Identity::Hwnd { value, source } => {
+                assert_eq!(value, 2_557_428);
+                assert_eq!(source, HwndSource::Uncombine);
+            }
+            other => panic!("unexpected identity: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_the_labelled_identity_as_an_exact_handle() {
+        match parse_identity(&button(Some("Window: 0x1e051c"))) {
+            Identity::Hwnd { value, source } => {
+                assert_eq!(value, 0x1e051c);
+                assert_eq!(source, HwndSource::Window);
+            }
+            other => panic!("unexpected identity: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_a_decimal_labelled_handle() {
+        match parse_identity(&button(Some("Window: 460520"))) {
+            Identity::Hwnd { value, source } => {
+                assert_eq!(value, 460_520);
+                assert_eq!(source, HwndSource::Window);
+            }
             other => panic!("unexpected identity: {other:?}"),
         }
     }
@@ -334,7 +397,7 @@ mod tests {
     #[test]
     fn tolerates_a_missing_space_after_the_prefix() {
         match parse_identity(&button(Some("Appid:TaskbarSwitcher_42"))) {
-            Identity::Hwnd(value) => assert_eq!(value, 42),
+            Identity::Hwnd { value, .. } => assert_eq!(value, 42),
             other => panic!("unexpected identity: {other:?}"),
         }
     }

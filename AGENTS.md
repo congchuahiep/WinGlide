@@ -228,6 +228,7 @@ The cycle is **identity based and stateful**. There is no fuzzy "guess which win
 1. `window/logical_window.rs` turns raw top-level windows into `LogicalWindow`s. A UWP/packaged app is **one** logical window: `ApplicationFrameWindow` (the primary, the only handle that can be activated) plus its `Windows.UI.Core.CoreWindow` content window, which is normally a child of the frame and only sometimes enumerated as a top-level sibling. `LogicalWindow::contains` resolves child handles through `GetAncestor(.., GA_ROOT)` and owned dialogs through `GA_ROOTOWNER`, so either handle counts as the same app window.
 2. `taskbar/slot.rs` builds one `Slot` per UIA button. Resolution order:
    - `Appid: TaskbarSwitcher_<hwnd>` - the exact handle written by the uncombine feature (checked against the window's AUMID);
+   - `Window: 0x<hwnd>` - the exact handle the shell exposes on a **labelled** taskbar (Windows 11 "never combine" with labels);
    - `Appid: <AUMID>` - exact case-insensitive AUMID equality with any member window (never `contains`);
    - no usable id - PID/title/process fallback, restricted to windows no exact slot claimed.
    A window belongs to at most one slot. A slot with several windows therefore means the shell itself groups them (same AUMID).
@@ -236,7 +237,7 @@ The cycle is **identity based and stateful**. There is no fuzzy "guess which win
 
 Things that look like details but matter:
 
-- Windows 11's button `automation_id` always carries the `Appid: ` prefix; `slot.rs` normalizes it before parsing.
+- Windows 11's button `automation_id` is `Appid: <AUMID>` for combined buttons, or `Window: 0x<hwnd>` on a labelled taskbar; `slot.rs` normalizes and parses both. Never treat a `Window:` id as an AUMID: doing so silently drops the exact handle and forces the fuzzy fallback, which is what made labelled layouts skip buttons and swap same-titled instances.
 - Button names are **localized**. They are only used by the fallback path and diagnostics; never build new logic on the English `"running window"` text.
 - The monitor is taken from the **foreground window**, not the cursor (`window/context.rs`); the cursor only decides when there is no foreground window.
 - `AllowSetForegroundWindow` was removed from activation: per its documentation it only works for a process that can already set the foreground window, so calling it from a background app is a no-op.

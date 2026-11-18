@@ -16,9 +16,10 @@ pub struct TaskbarButton {
     /// PID of the process owning the button (usually explorer.exe on Win11)
     pub process_id: i32,
 
-    /// Automation ID from UIA: `Appid: <AUMID>` on Windows 11.
-    ///
-    /// For windows split by the uncombine feature this is
-    /// `Appid: TaskbarSwitcher_<hwnd>`, which contains the exact window handle.
+    /// Automation ID from UIA. On Windows 11 this is one of:
+    /// - `Appid: <AUMID>` for a combined button;
+    /// - `Window: 0x<hwnd>` for a labelled ("never combine") button, which is the
+    ///   exact window handle;
+    /// - `Appid: TaskbarSwitcher_<hwnd>` for a window split by the uncombine feature.
     pub automation_id: Option<String>,
 }
