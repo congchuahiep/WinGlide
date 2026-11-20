@@ -124,7 +124,16 @@ unsafe extern "system" fn hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARA
     if n_code >= 0 {
         let msg = w_param.0 as u32;
         if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
-            let vk = (*(l_param.0 as *const KBDLLHOOKSTRUCT)).vkCode;
+            let keyboard = &*(l_param.0 as *const KBDLLHOOKSTRUCT);
+
+            // Ignore synthetic input (the activation ladder taps ALT and can click the
+            // taskbar). Reacting to our own injected events would re-enter the hotkey
+            // dispatch and could loop.
+            if keyboard.flags.0 & LLKHF_INJECTED.0 != 0 {
+                return CallNextHookEx(None, n_code, w_param, l_param);
+            }
+
+            let vk = keyboard.vkCode;
             let matched_id = STATE.with(|s| {
                 let state = s.borrow();
                 state

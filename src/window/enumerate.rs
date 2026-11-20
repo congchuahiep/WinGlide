@@ -15,7 +15,7 @@ use windows::Win32::{
     UI::WindowsAndMessaging::{
         EnumWindows, GetClassNameW, GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextW,
         GetWindowThreadProcessId, IsWindowVisible, GWL_EXSTYLE, GW_OWNER, WS_EX_APPWINDOW,
-        WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
     },
 };
 use windows_core::BOOL;
@@ -73,6 +73,7 @@ unsafe extern "system" fn enum_windows_callback(
     let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
     let is_tool_window = (ex_style & WS_EX_TOOLWINDOW.0) != 0;
     let is_app_window = (ex_style & WS_EX_APPWINDOW.0) != 0;
+    let is_no_activate = (ex_style & WS_EX_NOACTIVATE.0) != 0;
     let is_transparent_overlay =
         (ex_style & WS_EX_TRANSPARENT.0) != 0 && (ex_style & WS_EX_LAYERED.0) != 0;
     let owner = GetWindow(hwnd, GW_OWNER);
@@ -83,6 +84,12 @@ unsafe extern "system" fn enum_windows_callback(
     }
 
     if is_tool_window {
+        return TRUE;
+    }
+
+    // A WS_EX_NOACTIVATE window can never be brought to the foreground, so it is not a
+    // valid cycle target (e.g. overlay HUDs and some tray helpers).
+    if is_no_activate {
         return TRUE;
     }
 
@@ -140,6 +147,14 @@ pub unsafe fn find_window_by_hwnd(hwnd: HWND) -> WindowInfo {
         String::from_utf16_lossy(&title_buf[..len as usize])
     };
 
+    let mut class_buf = [0u16; 256];
+    let class_len = GetClassNameW(hwnd, &mut class_buf);
+    let class_name = if class_len == 0 {
+        String::new()
+    } else {
+        String::from_utf16_lossy(&class_buf[..class_len as usize])
+    };
+
     let mut pid: u32 = 0;
     GetWindowThreadProcessId(hwnd, Some(&mut pid));
 
@@ -158,6 +173,7 @@ pub unsafe fn find_window_by_hwnd(hwnd: HWND) -> WindowInfo {
         process_id: pid,
         process_name: get_process_name(pid),
         aumid: get_aumid(hwnd),
+        class_name,
     }
 }
 

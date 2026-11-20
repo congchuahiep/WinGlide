@@ -96,3 +96,5 @@ This project is open-source and licensed under the MIT License.
 ## Limitations & Requirements
 
 - **Windows 11 Only**: Relies on the modern Windows 11 XAML taskbar implementation (`Taskbar.TaskListButtonAutomationPeer`).
+- **Elevated windows and hook-only hotkeys**: Windows-reserved combinations (e.g. `Win+1`..`Win+9`, `Win+L`) are handled by a low-level keyboard hook, and Windows does not deliver input to such a hook while an elevated window has focus. Hotkeys WinGlide can register (including the default `Win+[` / `Win+]`) keep working there.
+- **Taskbar click fallback**: when Windows refuses a direct activation, WinGlide may briefly move the cursor to the taskbar button and restore it. This only happens for single-window buttons, so it cannot open a thumbnail flyout.

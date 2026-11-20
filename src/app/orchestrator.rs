@@ -539,19 +539,13 @@ impl App {
     fn handle_hotkey(&self, wparam: WPARAM) {
         match self.hotkey_manager.action_from_id(wparam.0 as i32) {
             Some(HotkeyAction::CycleLeft) => {
-                match self.enumerator.cycle_to_neighbor(
-                    self.uncombine_enabled.load(Ordering::SeqCst),
-                    CycleDirection::Backward,
-                ) {
+                match self.enumerator.cycle_to_neighbor(CycleDirection::Backward) {
                     Ok(_) => { /* Success */ }
                     Err(e) => error!("Error cycling taskbar: {e}"),
                 }
             }
             Some(HotkeyAction::CycleRight) => {
-                match self.enumerator.cycle_to_neighbor(
-                    self.uncombine_enabled.load(Ordering::SeqCst),
-                    CycleDirection::Forward,
-                ) {
+                match self.enumerator.cycle_to_neighbor(CycleDirection::Forward) {
                     Ok(_) => { /* Success */ }
                     Err(e) => error!("Error cycling taskbar: {e}"),
                 }

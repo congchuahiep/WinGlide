@@ -44,20 +44,25 @@ use windows::Win32::UI::Shell::IVirtualDesktopManager;
 use windows::Win32::UI::Shell::VirtualDesktopManager;
 use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, FindWindowW, GetForegroundWindow};
 
-use super::button_window::ButtonWindowMap;
+use super::cycle_state::CycleState;
 use super::explorer_process::invalidate_explorer_pid_cache;
-use super::{TargetWindow, TaskbarButton};
+use super::slot::SlotPlan;
+use super::TaskbarButton;
 use crate::event::UiaEventHook;
-use crate::shared::text::truncate;
-use crate::window::activate::force_activate;
+use crate::window::activate;
 use crate::window::context::WindowContext;
 use crate::window::enumerate::find_visible_windows;
+use crate::window::logical_window::group_logical_windows;
 
 /// Cache TTL: 1 second. If no WinEvent invalidates it, the cache auto-expires after 1s.
 const CACHE_TTL_SECS: f64 = 1.0;
 
-/// Button cache with timestamp.
+/// Button cache with timestamp and the monitor it belongs to.
+///
+/// The monitor is part of the key: with a taskbar on several monitors, a cache that only
+/// remembered the buttons would return another monitor's buttons for up to a second.
 struct ButtonCache {
+    monitor: HMONITOR,
     buttons: Vec<TaskbarButton>,
     created_at: Instant,
 }
@@ -96,8 +101,8 @@ pub struct TaskbarEnumerator {
     /// Upon explorer restart, [`Self::refresh_taskbar_hwnd`] will drop the old and create a new one.
     uia_thread_id: Cell<u32>,
 
-    /// Index of the last active button.
-    last_active_index: Cell<Option<usize>>,
+    /// Explicit cycle position and anti-stuck bookkeeping.
+    cycle_state: RefCell<CycleState>,
 }
 
 /// Life cycle implementation
@@ -141,7 +146,7 @@ impl TaskbarEnumerator {
                 last_desktop_id: RefCell::new(None),
                 uia_hooks: RefCell::new(Vec::new()),
                 uia_thread_id: Cell::new(0),
-                last_active_index: Cell::new(None),
+                cycle_state: RefCell::new(CycleState::new()),
             })
         }
     }
@@ -198,141 +203,87 @@ impl TaskbarEnumerator {
 
 /// Core implementation
 impl TaskbarEnumerator {
-    /// Cycles to the next window on the taskbar and activates the window.
+    /// Cycles to the next window on the taskbar and activates it.
+    ///
+    /// The order is the taskbar order of the current monitor, with grouped buttons
+    /// expanded in place. The source is the focused window when it can be resolved, and
+    /// the stored cursor otherwise, so an app the matcher cannot identify (UWP) still
+    /// moves the cycle forward instead of trapping it.
     ///
     /// # Errors
     ///
-    /// Returns an error if no window could be found to cycle to.
+    /// Returns an error only when the taskbar buttons cannot be enumerated.
     #[instrument(level = "debug", skip_all)]
-    pub fn cycle_to_neighbor(
-        &self,
-        uncombine_enabled: bool,
-        direction: CycleDirection,
-    ) -> anyhow::Result<()> {
-        let foreground = unsafe { GetForegroundWindow() };
-        let target = self.find_neighbor_window(foreground, uncombine_enabled, direction)?;
+    pub fn cycle_to_neighbor(&self, direction: CycleDirection) -> anyhow::Result<()> {
+        let context = WindowContext::current_state();
+        let buttons = self.enumerate_buttons_by_monitor(context.monitor)?;
+        if buttons.is_empty() {
+            warn!("No taskbar buttons on the current monitor");
+            return Ok(());
+        }
 
-        match target {
-            Some(target) => {
-                debug!(
-                    "Activating '{}' (grouped={})",
-                    truncate(&target.name, 30),
-                    target.is_grouped,
-                );
+        let windows = group_logical_windows(find_visible_windows(Some(&context)));
+        let plan = SlotPlan::build(&buttons, windows);
 
-                let ok = unsafe { force_activate(target.hwnd) };
-                if !ok {
-                    warn!("Cannot activate window '{}'", truncate(&target.name, 30),);
+        let press = {
+            let mut state = self.cycle_state.borrow_mut();
+            state.plan_press(&plan, Some(context.foreground_window), direction)
+        };
+
+        debug!(
+            "cycle {:?}: source={:?} | {}",
+            direction,
+            press.source.map(|c| c.slot),
+            plan.summary()
+        );
+
+        if press.candidates.is_empty() {
+            warn!("No window left to cycle to");
+            return Ok(());
+        }
+
+        let mut attempted = Vec::new();
+        for candidate in &press.candidates {
+            let target = &plan.windows[candidate.window];
+            let slot = &plan.slots[candidate.slot];
+
+            // The click fallback is only safe for a button that represents a single
+            // window; clicking a grouped button opens the thumbnail flyout instead of
+            // switching, which would leave the ui in a state the user did not ask for.
+            let button_rect = (slot.targets.len() == 1).then_some(slot.rect);
+
+            debug!(
+                "cycle: trying '{}' class='{}' primary={:?} from slot [{}] '{}'",
+                target.title, target.class_name, target.primary, slot.index, slot.name
+            );
+
+            match activate::activate(target, button_rect) {
+                Some(method) => {
+                    self.cycle_state.borrow_mut().record_success(target);
+                    debug!(
+                        "cycle: activated '{}' ({:?}) via {:?}",
+                        target.title, target.primary, method
+                    );
+                    return Ok(());
+                }
+                None => {
+                    warn!(
+                        "cycle: cannot activate '{}' ({:?})",
+                        target.title, target.primary
+                    );
+                    attempted.push(target.primary);
                 }
             }
-            None => warn!("No window found to cycle to"),
+        }
+
+        if let Some(first) = press.candidates.first() {
+            let first_primary = plan.windows[first.window].primary;
+            self.cycle_state
+                .borrow_mut()
+                .record_failure(first_primary, &attempted);
         }
 
         Ok(())
-    }
-
-    /// Finds the next window to the left/right of `source` on the taskbar.
-    ///
-    /// Flow: enumerate buttons -> find active index -> compute next index ->
-    /// match target button with window (via `ButtonWindowMap`) -> return target.
-    #[instrument(level = "debug", skip_all)]
-    fn find_neighbor_window(
-        &self,
-        source: HWND,
-        uncombine_enabled: bool,
-        direction: CycleDirection,
-    ) -> anyhow::Result<Option<TargetWindow>> {
-        /// Returns the index of the next valid button, or `None` if no valid button is found.
-        fn get_next_valid_button_index(
-            buttons: &[TaskbarButton],
-            button_map: &ButtonWindowMap,
-            source_index: usize,
-            direction: CycleDirection,
-        ) -> Option<usize> {
-            let mut target_index = source_index;
-            let mut attempts = 0;
-
-            loop {
-                attempts += 1;
-                if attempts > buttons.len() {
-                    return None;
-                }
-
-                target_index = match direction {
-                    CycleDirection::Forward => (target_index + 1) % buttons.len(),
-                    CycleDirection::Backward => {
-                        if target_index == 0 {
-                            buttons.len() - 1
-                        } else {
-                            target_index - 1
-                        }
-                    }
-                };
-
-                let target_button = &buttons[target_index];
-                if !button_map.find_windows_by_button(target_button).is_empty() {
-                    return Some(target_index);
-                }
-            }
-        }
-
-        let current_context = WindowContext::current_state();
-        let buttons = self.enumerate_buttons_by_monitor(current_context.monitor)?;
-        if buttons.is_empty() {
-            return Ok(None);
-        }
-
-        let current_monitor_windows = find_visible_windows(Some(&current_context));
-        let button_map = ButtonWindowMap::new(&buttons, &current_monitor_windows);
-
-        let source_index = match button_map.find_button_index_by_hwnd(source) {
-            Some(i) => {
-                self.last_active_index.set(Some(i));
-                i
-            }
-            None => self
-                .last_active_index
-                .get()
-                .filter(|&i| i < buttons.len())
-                .unwrap_or(0),
-        };
-
-        let target_index =
-            match get_next_valid_button_index(&buttons, &button_map, source_index, direction) {
-                Some(idx) => idx,
-                None => return Ok(None),
-            };
-        let target_button = &buttons[target_index];
-
-        debug!(
-            "Source button [{}]: '{}' AUMID '{:?}'",
-            source_index, buttons[source_index].name, buttons[source_index].automation_id
-        );
-
-        debug!(
-            "Target button [{}]: '{}' AUMID '{:?}'",
-            target_index, target_button.name, target_button.automation_id
-        );
-
-        match uncombine_enabled {
-            true => Ok(button_map
-                .find_window_by_button(target_button)
-                .map(|w| TargetWindow {
-                    name: w.title,
-                    hwnd: w.hwnd,
-                    is_grouped: false,
-                })),
-            false => {
-                let windows = button_map.find_windows_by_button(target_button);
-                let is_grouped = windows.len() > 1;
-
-                Ok(windows.into_iter().next().map(|w| TargetWindow {
-                    name: w.title,
-                    hwnd: w.hwnd,
-                    is_grouped,
-                }))
-            }
-        }
     }
 
     /// Gets all HWNDs of taskbars (primary and secondary).
@@ -360,9 +311,11 @@ impl TaskbarEnumerator {
         hwnds
     }
 
-    /// Returns taskbar buttons on the current monitor (containing the cursor or foreground window)
+    /// Returns taskbar buttons on the given monitor.
     ///
-    /// Cached with a 1-second TTL, invalidated by UIA events or desktop switches
+    /// Cached with a 1-second TTL, invalidated by UIA events or desktop switches. The
+    /// monitor is part of the cache key so moving between monitors never serves the
+    /// other monitor's buttons.
     pub fn enumerate_buttons_by_monitor(
         &self,
         monitor: HMONITOR,
@@ -373,7 +326,7 @@ impl TaskbarEnumerator {
 
         if let Some(ref cache) = *self.button_cache.borrow() {
             let age = cache.created_at.elapsed().as_secs_f64();
-            if age < CACHE_TTL_SECS {
+            if cache.monitor == monitor && age < CACHE_TTL_SECS {
                 debug!("Using cached buttons (age: {:.0}ms)", age * 1000.0);
                 return Ok(cache.buttons.clone());
             }
@@ -397,6 +350,7 @@ impl TaskbarEnumerator {
 
             let buttons = self.enumerate_buttons(target_taskbar)?;
             *self.button_cache.borrow_mut() = Some(ButtonCache {
+                monitor,
                 buttons: buttons.clone(),
                 created_at: Instant::now(),
             });
@@ -609,5 +563,73 @@ impl TaskbarEnumerator {
             debug!("Button cache invalidated (event)");
             *cache = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod live_probe {
+    use super::*;
+
+    /// Manual probe: prints how the live taskbar maps to windows.
+    /// Run with `cargo test print_slot_plan -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads the live desktop"]
+    fn print_slot_plan() {
+        let enumerator = TaskbarEnumerator::new().expect("enumerator");
+        let context = WindowContext::current_state();
+        let buttons = enumerator
+            .enumerate_buttons_by_monitor(context.monitor)
+            .expect("buttons");
+        let windows = group_logical_windows(find_visible_windows(Some(&context)));
+        let plan = SlotPlan::build(&buttons, windows);
+
+        println!("foreground: {:?}", context.foreground_window);
+        println!("buttons: {}", buttons.len());
+        for slot in &plan.slots {
+            println!(
+                "slot {} '{}' key={} targets={:?}",
+                slot.index,
+                slot.name,
+                slot.key,
+                slot.targets
+                    .iter()
+                    .map(|&index| (plan.windows[index].primary, plan.windows[index].title.as_str()))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Manual probe: presses the cycle once and restores the original window.
+    #[test]
+    #[ignore = "activates a real window"]
+    fn live_cycle_once() {
+        let enumerator = TaskbarEnumerator::new().expect("enumerator");
+        let original = WindowContext::current_state().foreground_window;
+        println!("before: {original:?}");
+
+        enumerator
+            .cycle_to_neighbor(CycleDirection::Forward)
+            .expect("forward press");
+        println!("after forward: {:?}", unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow()
+        });
+
+        enumerator
+            .cycle_to_neighbor(CycleDirection::Backward)
+            .expect("backward press");
+        println!("after backward: {:?}", unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow()
+        });
+
+        let context = WindowContext::current_state();
+        if context.foreground_window != original {
+            let windows = group_logical_windows(find_visible_windows(Some(&context)));
+            if let Some(target) = windows.iter().find(|window| window.contains(original)) {
+                println!("restoring via {:?}", activate::activate(target, None));
+            }
+        }
+        println!("after restore: {:?}", unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow()
+        });
     }
 }

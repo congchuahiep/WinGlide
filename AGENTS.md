@@ -143,28 +143,30 @@ cli/
 └── args.rs                 -> manual arg parsing (Args / RunMode: ConsoleWorker / SettingsUi / BackgroundApp)
 hotkey/
 ├── mod.rs                  -> re-export: HotkeyManager, HotkeyAction, LowLevelKeyHook
-├── manager.rs              -> HotkeyManager: RegisterHotKey + dispatch classification (CycleLeft/CycleRight/SwitchVirtualDesktop)
+├── manager.rs              -> HotkeyManager: RegisterHotKey first, LowLevelHook fallback (CycleLeft/CycleRight/SwitchVirtualDesktop)
 └── low_level_hook.rs       -> generic WH_KEYBOARD_LL hook: overrides Windows-owned Win+key combos; posts WM_HOTKEY with the same IDs
 event/
 ├── mod.rs                  -> re-export: WinEventHook, UiaEventHook, InvalidateSource, reset_cache_invalidated_flag
 ├── uia.rs                  -> UIA StructureChanged hook -> WM_APP_INVALIDATE_CACHE
 └── winevent.rs             -> WinEvent EVENT_OBJECT_SHOW hook -> WM_APP_UNCOMBINE
 taskbar/
-├── mod.rs                  -> re-export: TaskbarEnumerator, CycleDirection, UncombineManager, Taskbar, TaskbarEdge, TaskbarButton, TargetWindow
+├── mod.rs                  -> re-export: TaskbarEnumerator, CycleDirection, UncombineManager, Taskbar, TaskbarEdge, TaskbarButton
 ├── snapshot.rs             -> Taskbar/TaskbarEdge: edge, thickness, DPI, labels mode of Shell_TrayWnd
-├── enumerator.rs           -> IUIAutomation: enumerate buttons, 1s TTL cache, cycle_to_neighbor
-├── button_window.rs        -> ButtonWindowMap: map button <-> window (AUMID -> PID -> Title -> Process)
+├── enumerator.rs           -> IUIAutomation: enumerate buttons, per-monitor 1s TTL cache, cycle_to_neighbor
+├── slot.rs                 -> SlotPlan: exact button identity (`Appid: <AUMID>` / `TaskbarSwitcher_<hwnd>`) -> windows
+├── cycle_state.rs          -> CycleState: cursor, flattened cycle order, blocked-window bookkeeping
 ├── uncombine.rs            -> UncombineManager: sets unique AppUserModelID per window
 ├── explorer_process.rs     -> explorer.exe PID cache (distinguishes shell buttons from app buttons)
-├── types.rs                -> TaskbarButton, TargetWindow
-└── utils.rs                -> clean_button_name
+├── types.rs                -> TaskbarButton
+└── utils.rs                -> clean_button_name, normalize_button_label
 window/
-├── mod.rs                  -> re-export: WindowInfo
-├── types.rs                -> WindowInfo
+├── mod.rs                  -> re-export: WindowInfo, LogicalWindow
+├── types.rs                -> WindowInfo (+ UWP_FRAME_CLASS / UWP_CONTENT_CLASS)
 ├── enumerate.rs            -> EnumWindows: find_visible_windows, find_window_by_hwnd, get_process_name
-├── activate.rs             -> force_activate (SetForegroundWindow + AttachThreadInput)
+├── logical_window.rs       -> LogicalWindow: groups a UWP frame with its content window; group_logical_windows
+├── activate.rs             -> activate (verified activation ladder) + force_activate (plain HWND path for VD jumps)
 ├── aumid.rs                -> get/set window AUMID (SHGetPropertyStoreForWindow)
-├── context.rs              -> WindowContext::current_state(): foreground window + monitor + virtual desktop
+├── context.rs              -> WindowContext::current_state(): foreground window + its monitor + virtual desktop
 └── system_class.rs         -> is_system_class (shell/OS classes to ignore)
 virtual_desktop/
 ├── mod.rs                  -> re-export: indicator
@@ -182,6 +184,7 @@ logging/
 ├── console.rs              -> detached console window over a named pipe
 └── debug_console.rs        -> attach_debug_console (--debug)
 shared/                     -> cross-cutting helpers used by more than one feature
+├── integrity.rs            -> is_process_elevated / is_window_elevated (UIPI guards)
 ├── package.rs              -> is_packaged() via GetCurrentPackageFullName (MSIX vs MSI/ZIP)
 ├── system_theme.rs         -> is_light_theme
 └── text.rs                 -> truncate
@@ -216,19 +219,33 @@ shared/                     -> cross-cutting helpers used by more than one featu
 ### Cache invalidation
 
 - Button cache (1s TTL) is invalidated by UIA `StructureChanged` events (not WinEvent). A `CACHE_INVALIDATED` AtomicBool prevents posting duplicate `WM_APP_INVALIDATE_CACHE` messages when multiple UIA events fire in rapid succession.
+- The cache records the monitor it was built for; with a taskbar on several monitors, a cache that only stored buttons would serve another monitor's buttons for up to a second.
 
 ### Explorer restart recovery
 
 - `TaskbarEnumerator::enumerate_buttons()` catches `EVENT_E_ALL_SUBSCRIBERS_FAILED (0x80040201)` and auto-recovers via `refresh_taskbar_hwnd()` - re-finds Shell_TrayWnd, re-subscribes UIA hooks, invalidates explorer PID cache.
 
-### Matching strategies (taskbar/button_window.rs)
+### Cycle model (taskbar/slot.rs + taskbar/cycle_state.rs)
 
-Button-to-window matching tries 4 strategies in order:
+The cycle is **identity based and stateful**. There is no fuzzy "guess which window belongs to this button" pass on the hot path, and no stale index fallback.
 
-1. **AppUserModelID** (button `automation_id` vs window `SHGetPropertyStoreForWindow`)
-2. **PID** (if button PID ≠ explorer PID)
-3. **Title** fuzzy match (after `clean_button_name` stripping)
-4. **Process name** (`.exe` stem match, allows windows with empty titles)
+1. `window/logical_window.rs` turns raw top-level windows into `LogicalWindow`s. A UWP/packaged app is **one** logical window: `ApplicationFrameWindow` (the primary, the only handle that can be activated) plus its `Windows.UI.Core.CoreWindow` content window, which is normally a child of the frame and only sometimes enumerated as a top-level sibling. `LogicalWindow::contains` resolves child handles through `GetAncestor(.., GA_ROOT)` and owned dialogs through `GA_ROOTOWNER`, so either handle counts as the same app window.
+2. `taskbar/slot.rs` builds one `Slot` per UIA button. Resolution order:
+   - `Appid: TaskbarSwitcher_<hwnd>` - the exact handle written by the uncombine feature (checked against the window's AUMID);
+   - `Window: 0x<hwnd>` - the exact handle the shell exposes on a **labelled** taskbar (Windows 11 "never combine" with labels);
+   - `Appid: <AUMID>` - exact case-insensitive AUMID equality with any member window (never `contains`);
+   - no usable id - PID/title/process fallback, restricted to windows no exact slot claimed.
+   A window belongs to at most one slot. A slot with several windows therefore means the shell itself groups them (same AUMID).
+3. `taskbar/cycle_state.rs` flattens slots left-to-right, expanding a grouped button in place by ascending handle (stable; never z-order, which would make a group oscillate). The source is the focused window when it resolves to a slot, otherwise the stored `cursor`. The cursor records the last target (successful or not) and windows that failed to activate are blocked for 10s, so an app that refuses activation can never trap the cycle.
+4. `window/activate.rs` tries, in order, verifying after each step: restore if minimized -> `SetForegroundWindow` -> attach input to the foreground/target thread + `SetActiveWindow`/`SetFocus` -> `SwitchToThisWindow` -> ALT tap (documented to unlock `SetForegroundWindow`) -> click the taskbar button. The click is only passed for single-window slots, because clicking a grouped button opens the thumbnail flyout instead of switching. The ALT tap is skipped when the foreground is elevated (UIPI blocks or redirects the injection), and the click is only made when the point under the cursor is actually over a taskbar window class, so a stale button rectangle can never turn it into a click inside the target app. Verification compares the logical window's members and top-level ancestors (`GA_ROOT` / `GA_ROOTOWNER`), never raw `HWND` equality.
+
+Things that look like details but matter:
+
+- Windows 11's button `automation_id` is `Appid: <AUMID>` for combined buttons, or `Window: 0x<hwnd>` on a labelled taskbar; `slot.rs` normalizes and parses both. Never treat a `Window:` id as an AUMID: doing so silently drops the exact handle and forces the fuzzy fallback, which is what made labelled layouts skip buttons and swap same-titled instances.
+- Button names are **localized**. They are only used by the fallback path and diagnostics; never build new logic on the English `"running window"` text.
+- The monitor is taken from the **foreground window**, not the cursor (`window/context.rs`); the cursor only decides when there is no foreground window.
+- `AllowSetForegroundWindow` was removed from activation: per its documentation it only works for a process that can already set the foreground window, so calling it from a background app is a no-op.
+- Debugging the mapping: `cargo test print_slot_plan -- --ignored --nocapture` prints the live slots (button name, identity key, resolved windows) without touching any window.
 
 ### Logging output
 
@@ -254,12 +271,16 @@ Button-to-window matching tries 4 strategies in order:
 - IDs 11..=19 = `SwitchVirtualDesktop(0..8)` (`Alt+1`..`Alt+9`), only registered when `jump_desktop_modifiers != 0`
 - All configurable via Settings GUI; `HotkeyManager::reload()` re-registers on `WM_APP_RELOAD_CONFIG`
 
-### Low-level hotkey dispatch (hotkey/low_level_hook.rs)
+### Hotkey dispatch (hotkey/manager.rs + hotkey/low_level_hook.rs)
 
-- `HotkeyManager` classifies every hotkey via `dispatch_for(modifiers)`: any combo **involving Win** gets `HotkeyDispatch::LowLevelHook`, everything else stays on `RegisterHotKey` (which cannot claim `Win+1..Win+9` because they are Windows-native taskbar shortcuts, nor reserved combos like `Win+L`).
-- `HotkeyManager::low_level_hotkeys()` hands the Win combos to `LowLevelKeyHook::set_hotkeys()` (called from `App::new` and `handle_reload_config`, both on the main message-loop thread).
+- Every hotkey is **first offered to `RegisterHotKey`**. On success the system owns the combination, consumes the key before it reaches the focused window, and posts `WM_HOTKEY`; this also works while an elevated window has focus, for combinations that include a modifier.
+- If `RegisterHotKey` fails and the combination has a **Win** modifier, the hotkey falls back to `LowLevelHook`. This is the path for combinations Windows already owns — `Win+1`..`Win+9`, `Win+L`, `Win+E`, ... — which fail with `ERROR_HOTKEY_ALREADY_REGISTERED (1409)`. The hook is therefore still the mechanism for overriding Windows shortcuts; it is no longer the mechanism for every Win combination. A non-Win failure is a real conflict and is reported as an error.
+- A hook installed by a non-elevated process does **not** receive input destined for an elevated window (UIPI), so hook-dispatched hotkeys are best-effort while an elevated window has focus. Registered hotkeys with modifiers do not have that limitation; prefer `RegisterHotKey` whenever the OS does not already own the combo.
+- `HotkeyManager::low_level_hotkeys()` hands only the fallback hotkeys to `LowLevelKeyHook::set_hotkeys()` (called from `App::new` and `handle_reload_config`, both on the main message-loop thread).
 - The generic `WH_KEYBOARD_LL` proc matches `(modifiers, vk)` with exact modifier semantics (mirrors `RegisterHotKey`), swallows the key (`LRESULT(1)`) so the native Windows behavior never fires, and posts `WM_HOTKEY` with the same hotkey ID, so `App::handle_hotkey` / `action_from_id` work unchanged for both mechanisms (including auto-repeat drain).
-- Hook state is a `thread_local` (the hook proc only runs on the installing thread); add a future low-level hotkey by assigning it `LowLevelHook` in `dispatch_for`/registration - no other wiring needed.
+- Hook state is a `thread_local` (the hook proc only runs on the installing thread); a future hotkey needs no extra wiring beyond registration falling back to `LowLevelHook`.
+- The hook ignores `LLKHF_INJECTED` events. The activation ladder taps ALT and can click the taskbar; reacting to our own synthetic input would re-enter hotkey dispatch.
+- Each hotkey logs `hotkey registered` or `hotkey is already owned; using the low-level hook` at startup/reload, including its combination and ID, so the active path is visible in the log.
 
 ### Custom window messages
 
