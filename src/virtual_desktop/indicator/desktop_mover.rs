@@ -1,12 +1,16 @@
 //! "Move current window to desktop N" actions and their right-click menu.
 
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, POINT};
+use std::sync::atomic::{AtomicIsize, Ordering};
+
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetClassNameW, GetCursorPos, GetForegroundWindow,
-    GetWindowLongW, GetWindowTextW, IsWindowVisible, SetForegroundWindow, SetWindowLongW,
-    TrackPopupMenu, GWL_EXSTYLE, MF_DISABLED, MF_GRAYED, MF_SEPARATOR, MF_STRING, TPM_LEFTALIGN,
-    TPM_RIGHTBUTTON, WS_EX_NOACTIVATE,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
+    GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowTextW,
+    IsWindowVisible, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowLongPtrW,
+    TrackPopupMenu, WINDOW_EX_STYLE, WNDCLASSW, GWLP_USERDATA, MF_DISABLED, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, TPM_LEFTALIGN, TPM_RIGHTBUTTON, WM_COMMAND, WS_POPUP,
 };
 
 use crate::shared::text::truncate;
@@ -24,30 +28,133 @@ pub(super) struct MoveTarget {
     pub(super) desktop_index: usize,
 }
 
+/// Last window that had the keyboard focus and can be a move target.
+///
+/// Clicking the indicator makes Windows drop the foreground window: the click
+/// deactivates the current app, but the indicator is a child of the taskbar and
+/// cannot take the focus itself. [`DesktopMover::capture_foreground`] records the
+/// window from `WM_MOUSEACTIVATE`, which arrives before that happens.
+static LAST_FOREGROUND: AtomicIsize = AtomicIsize::new(0);
+
+/// `hwnd` when it is a window a user would expect to move: visible, and not one
+/// of the shell's or WinGlide's own windows.
+unsafe fn move_target(hwnd: HWND) -> Option<HWND> {
+    if hwnd.is_invalid() || !IsWindowVisible(hwnd).as_bool() {
+        return None;
+    }
+    let mut class_buf = [0u16; 256];
+    let len = GetClassNameW(hwnd, &mut class_buf);
+    let class_name = String::from_utf16_lossy(&class_buf[..len.max(0) as usize]);
+    if is_system_class(&class_name)
+        || class_name == "WinGlideTray"
+        || class_name == "TaskbarSwitcherIndicator"
+    {
+        return None;
+    }
+    Some(hwnd)
+}
+
 /// Stateless helper for the move-to-desktop feature.
 pub(super) struct DesktopMover;
 
 impl DesktopMover {
-    /// The current foreground application window, rejecting system/hidden windows.
-    pub(super) fn foreground_target() -> Option<HWND> {
+    /// Creates the hidden top-level window that owns the indicator's
+    /// right-click menu.
+    ///
+    /// `TrackPopupMenu` needs an owner that can be the foreground window, and a
+    /// child of the taskbar never can. This 0x0 window is never shown: it exists
+    /// only to own the menu and to forward the chosen command back to the
+    /// indicator, which holds the move target.
+    pub(super) fn create_menu_host(indicator: HWND) -> HWND {
         unsafe {
-            let hwnd = GetForegroundWindow();
-            if hwnd.is_invalid() || !IsWindowVisible(hwnd).as_bool() {
-                return None;
+            let Ok(hinstance) = GetModuleHandleW(None) else {
+                return HWND(std::ptr::null_mut());
+            };
+            let wnd_class = WNDCLASSW {
+                hInstance: HINSTANCE(hinstance.0),
+                lpszClassName: w!("TaskbarIndicatorMenuHost"),
+                lpfnWndProc: Some(menu_host_proc),
+                ..Default::default()
+            };
+            let _ = RegisterClassW(&wnd_class);
+
+            let Ok(hwnd) = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("TaskbarIndicatorMenuHost"),
+                w!("IndicatorMenuHost"),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(hinstance.into()),
+                None,
+            ) else {
+                return HWND(std::ptr::null_mut());
+            };
+
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, indicator.0 as isize);
+            hwnd
+        }
+    }
+
+    /// Destroys a menu owner window created by [`Self::create_menu_host`].
+    pub(super) fn destroy_menu_host(hwnd: HWND) {
+        if !hwnd.is_invalid() {
+            unsafe {
+                let _ = DestroyWindow(hwnd);
             }
-            let mut class_buf = [0u16; 256];
-            let len = GetClassNameW(hwnd, &mut class_buf);
-            if len > 0 {
-                let class_name = String::from_utf16_lossy(&class_buf[..len as usize]);
-                // Never treat our own windows (tray / indicator) as move targets.
-                if is_system_class(&class_name)
-                    || class_name == "WinGlideTray"
-                    || class_name == "TaskbarSwitcherIndicator"
-                {
-                    return None;
-                }
+        }
+    }
+
+    /// The window a "move to desktop" action should act on: the one that had the
+    /// focus before the indicator was clicked, falling back to the live
+    /// foreground window.
+    pub(super) fn foreground_target() -> Option<HWND> {
+        let cached = LAST_FOREGROUND.load(Ordering::Relaxed);
+        if cached != 0 {
+            let hwnd = HWND(cached as *mut _);
+            // Guard against the window having been closed since the event.
+            if unsafe { IsWindowVisible(hwnd).as_bool() } {
+                tracing::debug!("move target: 0x{cached:X} (last focused window)");
+                return Some(hwnd);
             }
-            Some(hwnd)
+        }
+
+        let live = unsafe { move_target(GetForegroundWindow()) };
+        live
+    }
+
+    /// Records the current foreground window if it can be a move target.
+    ///
+    /// Called while the pointer hovers over the indicator and on
+    /// `WM_MOUSEACTIVATE` - both happen before a click clears the foreground
+    /// window. Cheap when nothing changed: the cached handle is compared first.
+    pub(super) fn capture_foreground() {
+        let hwnd = unsafe { GetForegroundWindow() };
+        if hwnd.0 as isize == LAST_FOREGROUND.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(target) = unsafe { move_target(hwnd) } {
+            LAST_FOREGROUND.store(target.0 as isize, Ordering::Relaxed);
+            tracing::debug!(
+                "move target captured before click: 0x{:X}",
+                target.0 as isize
+            );
+        }
+    }
+
+    /// Gives the focus back to the window the user was working in.
+    ///
+    /// Clicking the indicator drops the foreground window, so a click that did
+    /// not land on a dot would otherwise leave the desktop without one.
+    pub(super) fn restore_foreground() {
+        if let Some(target) = Self::foreground_target() {
+            unsafe {
+                let _ = SetForegroundWindow(target);
+            }
         }
     }
 
@@ -76,7 +183,10 @@ impl DesktopMover {
 
     /// Shows the "Move to Desktop N" popup menu. The window title goes in a
     /// disabled header so the menu items stay short.
-    pub(super) fn show_menu(indicator_hwnd: HWND, target: MoveTarget) {
+    ///
+    /// `menu_host` is the hidden top-level window from
+    /// [`Self::create_menu_host`]; it owns the menu and receives the command.
+    pub(super) fn show_menu(menu_host: HWND, target: MoveTarget) {
         unsafe {
             let Ok(desktops) = winvd::get_desktops() else {
                 return;
@@ -134,26 +244,18 @@ impl DesktopMover {
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
 
-            // TrackPopupMenu needs its owner window to be foreground. The
-            // indicator is WS_EX_NOACTIVATE, so temporarily clear that style
-            // while the menu is shown.
-            let ex_style = GetWindowLongW(indicator_hwnd, GWL_EXSTYLE);
-            let _ = SetWindowLongW(
-                indicator_hwnd,
-                GWL_EXSTYLE,
-                (ex_style as u32 & !WS_EX_NOACTIVATE.0) as i32,
-            );
-            let _ = SetForegroundWindow(indicator_hwnd);
+            // The hidden owner is a top-level window, so it can be foreground;
+            // that is what makes the menu close on an outside click.
+            let _ = SetForegroundWindow(menu_host);
             let _ = TrackPopupMenu(
                 hmenu,
                 TPM_LEFTALIGN | TPM_RIGHTBUTTON,
                 pt.x,
                 pt.y,
                 None,
-                indicator_hwnd,
+                menu_host,
                 None,
             );
-            let _ = SetWindowLongW(indicator_hwnd, GWL_EXSTYLE, ex_style);
 
             let _ = DestroyMenu(hmenu);
 
@@ -199,4 +301,22 @@ fn move_and_jump_to_desktop(hwnd: HWND, target: &winvd::Desktop) {
 /// Null-terminated UTF-16 copy of `s` for Win32 string parameters.
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Window procedure of the hidden menu owner: hands the menu result to the
+/// indicator (via `GWLP_USERDATA`) and does nothing else.
+unsafe extern "system" fn menu_host_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_COMMAND {
+        let indicator = HWND(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut _);
+        if !indicator.is_invalid() {
+            let _ = SendMessageW(indicator, WM_COMMAND, Some(wparam), Some(lparam));
+        }
+        return LRESULT(0);
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
 }

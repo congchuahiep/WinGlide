@@ -1,7 +1,9 @@
 //! On-taskbar indicator for virtual desktops.
 //!
-//! The indicator is a layered popup owned by `Shell_TrayWnd` that paints one dot
-//! per virtual desktop and handles mouse input to switch desktops or move windows.
+//! The indicator is a layered **child window of `Shell_TrayWnd`** that paints one
+//! dot per virtual desktop and handles mouse input to switch desktops or move
+//! windows. Being a child keeps it in the taskbar's own z-order band, so it stays
+//! visible over the taskbar's XAML content - including while Task View is open.
 //!
 //! This file is only the module's table of contents. The behaviour lives in files
 //! named after their primary type:
@@ -18,14 +20,21 @@ mod canvas;
 mod desktop_mover;
 mod dot_painter;
 mod indicator_geometry;
+mod indicator_mode;
 mod indicator_position;
 mod indicator_settings;
 mod indicator_window;
 mod taskbar_watcher;
 mod utils;
 
+pub use indicator_mode::IndicatorMode;
 pub use indicator_settings::IndicatorSettings;
 pub use indicator_window::IndicatorWindow;
+
+/// 1-based number of the active virtual desktop, for the tray-icon mode.
+pub fn current_desktop_number() -> usize {
+    utils::current_index() + 1
+}
 
 use windows::Win32::UI::WindowsAndMessaging::WM_USER;
 

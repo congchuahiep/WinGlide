@@ -18,7 +18,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::messages::{
-    WM_APP_INVALIDATE_CACHE, WM_APP_RELOAD_CONFIG, WM_APP_UNCOMBINE,
+    WM_APP_DESKTOP_CHANGED, WM_APP_INVALIDATE_CACHE, WM_APP_RELOAD_CONFIG, WM_APP_UNCOMBINE,
     WM_USER_TRAYICON,
 };
 use crate::app_setting::AppConfig;
@@ -28,7 +28,9 @@ use crate::logging::console::{self, CONSOLE_VISIBLE};
 use crate::app_setting;
 use crate::taskbar::{CycleDirection, TaskbarEnumerator, UncombineManager};
 use crate::tray::{TrayIcon, IDM_EXIT, IDM_SETTINGS, IDM_SHOW_CONSOLE};
-use crate::virtual_desktop::indicator::{IndicatorSettings, IndicatorWindow};
+use crate::virtual_desktop::indicator::{
+    current_desktop_number, IndicatorMode, IndicatorSettings, IndicatorWindow,
+};
 use crate::window::activate::force_activate;
 use crate::window::context::WindowContext;
 use crate::window::enumerate::find_visible_windows;
@@ -122,6 +124,9 @@ pub struct App {
     /// Indicator window displaying Virtual Desktop status.
     indicator_window: Option<IndicatorWindow>,
 
+    /// Where the desktop indicator is drawn: dots on the taskbar or the tray icon.
+    indicator_mode: IndicatorMode,
+
     /// Remaining [`TIMER_TRAY_RESYNC`] ticks of the post-change tray icon re-check.
     tray_resync_ticks: u32,
 }
@@ -143,9 +148,16 @@ impl App {
         let uncombine_manager = Box::new(UncombineManager::new());
         let mut tray_icon = TrayIcon::create();
         let hidden_window = Self::create_hidden_window()?;
+        let indicator_mode = IndicatorMode::from_u8(config.indicator_mode);
 
         unsafe {
             WM_TASKBARCREATED = RegisterWindowMessageW(w!("TaskbarCreated"));
+        }
+
+        // In tray mode the icon itself shows the desktop number; set it before
+        // registering so the very first icon the shell draws is already right.
+        if config.desktop_indicator && indicator_mode.is_tray() {
+            tray_icon.set_badge(Some(current_desktop_number()));
         }
 
         tray_icon.register(hidden_window.hwnd)?;
@@ -172,6 +184,7 @@ impl App {
             tray_icon,
             hidden_window,
             indicator_window,
+            indicator_mode,
             tray_resync_ticks: 0,
         })
     }
@@ -270,6 +283,14 @@ impl App {
                 self.handle_reload_config();
                 Some(LRESULT(0))
             }
+            // The indicator thread saw a virtual-desktop switch. In tray mode the
+            // icon itself is the indicator, so repaint its number.
+            WM_APP_DESKTOP_CHANGED => {
+                if self.indicator_mode.is_tray() && self.indicator_window.is_some() {
+                    self.tray_icon.set_badge(Some(wparam.0.max(1)));
+                }
+                Some(LRESULT(0))
+            }
             // Commands sent from the system tray context menu
             WM_COMMAND => {
                 let id = loword(wparam.0 as u32);
@@ -323,10 +344,26 @@ impl App {
                 if let Err(e) = self.tray_icon.reregister() {
                     error!("TrayIcon reregister: {e}");
                 }
-                // The tray re-grew after our icon was re-added; re-sync the
-                // indicator so it stays clear of the tray.
-                if let Some(ind) = &self.indicator_window {
-                    ind.refresh();
+                // The indicator is a child of the old taskbar window, so Explorer
+                // restarting leaves it either destroyed or parented to a window
+                // that no longer exists. Re-attach the survivor, rebuild the rest.
+                if let Some(ind) = self.indicator_window.take() {
+                    if ind.is_alive() {
+                        ind.refresh();
+                        self.indicator_window = Some(ind);
+                    } else {
+                        drop(ind);
+                        unsafe {
+                            let settings = IndicatorSettings::from_config(&AppConfig::load());
+                            match IndicatorWindow::new(settings) {
+                                Ok(mut rebuilt) => {
+                                    rebuilt.run();
+                                    self.indicator_window = Some(rebuilt);
+                                }
+                                Err(e) => error!("Failed to recreate IndicatorWindow: {e}"),
+                            }
+                        }
+                    }
                 }
                 Some(LRESULT(0))
             }
@@ -336,6 +373,11 @@ impl App {
             // can move the notification area after the message has already been delivered.
             WM_SETTINGCHANGE | WM_DPICHANGED | WM_DISPLAYCHANGE | WM_THEMECHANGED => {
                 self.schedule_tray_resync(msg);
+                // The indicator is a child of the taskbar, so it no longer
+                // receives these broadcasts itself; repaint it from here.
+                if let Some(ind) = &self.indicator_window {
+                    ind.refresh();
+                }
                 Some(LRESULT(0))
             }
 
@@ -442,6 +484,7 @@ impl App {
     fn handle_reload_config(&mut self) {
         info!("Reloading configuration...");
         let config = AppConfig::load();
+        self.indicator_mode = IndicatorMode::from_u8(config.indicator_mode);
 
         self.uncombine_enabled
             .store(config.uncombine_mode, Ordering::SeqCst);
@@ -475,6 +518,15 @@ impl App {
         } else {
             self.indicator_window = None;
         }
+
+        // In tray mode the notification-area icon is the indicator: show the
+        // number while it is enabled, and restore the plain glyph otherwise.
+        let badge = if config.desktop_indicator && self.indicator_mode.is_tray() {
+            Some(current_desktop_number())
+        } else {
+            None
+        };
+        self.tray_icon.set_badge(badge);
 
         info!("Configuration reloaded successfully.");
     }

@@ -15,5 +15,9 @@ pub const WM_APP_INVALIDATE_CACHE: u32 = WM_USER + 0x101;
 /// Posted to the hidden window to make the background app reload its config.
 pub const WM_APP_RELOAD_CONFIG: u32 = WM_USER + 0x102;
 
+/// Posted to the hidden window when the active virtual desktop changed;
+/// `wparam` is the new 1-based desktop number.
+pub const WM_APP_DESKTOP_CHANGED: u32 = WM_USER + 0x103;
+
 /// `Shell_NotifyIconW` callback message delivered to the hidden window.
 pub const WM_USER_TRAYICON: u32 = WM_USER + 0x200;

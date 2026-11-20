@@ -333,15 +333,20 @@ impl TaskbarEnumerator {
         }
 
         unsafe {
-            let taskbars = self.taskbars.borrow();
-            let target_taskbar = taskbars
-                .iter()
-                .find(|&&hwnd| {
-                    let hmonitor_tb = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
-                    !hmonitor_tb.is_invalid() && hmonitor_tb.0 == monitor.0
-                })
-                .copied()
-                .unwrap_or_else(|| *taskbars.first().unwrap_or(&HWND::default()));
+            // Copy the target handle out and drop the borrow before enumerating:
+            // `enumerate_buttons` may call `refresh_taskbar_hwnd`, which takes a
+            // mutable borrow of the same `RefCell` when Explorer restarted mid-call.
+            let target_taskbar = {
+                let taskbars = self.taskbars.borrow();
+                taskbars
+                    .iter()
+                    .find(|&&hwnd| {
+                        let hmonitor_tb = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+                        !hmonitor_tb.is_invalid() && hmonitor_tb.0 == monitor.0
+                    })
+                    .copied()
+                    .unwrap_or_else(|| *taskbars.first().unwrap_or(&HWND::default()))
+            };
 
             let buttons = self.enumerate_buttons(target_taskbar)?;
             *self.button_cache.borrow_mut() = Some(ButtonCache {

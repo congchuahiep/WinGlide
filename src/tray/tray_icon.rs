@@ -35,9 +35,11 @@ const TEXT_EXIT: PCWSTR = w!("Exit");
 pub struct TrayIcon {
     /// Data structure containing the configuration information of the system tray icon.
     data: NOTIFYICONDATAW,
-    /// Pixel size and theme the current `hIcon` was built for, so `resync` can skip
+    /// Pixel size, theme and badge the current `hIcon` was built for, so `resync` can skip
     /// the whole rebuild when nothing relevant changed.
-    icon_key: (i32, bool),
+    icon_key: (i32, bool, Option<usize>),
+    /// Desktop number drawn into the icon, or `None` for the plain glyph.
+    badge: Option<usize>,
 }
 
 impl TrayIcon {
@@ -47,11 +49,39 @@ impl TrayIcon {
     pub fn create() -> Self {
         let size = Self::icon_size();
         let light = is_light_theme();
-        let data = Self::create_nid(Self::get_hicon(size, light));
+        let data = Self::create_nid(Self::get_hicon(size, light, None));
         Self {
             data,
-            icon_key: (size, light),
+            icon_key: (size, light, None),
+            badge: None,
         }
+    }
+
+    /// Shows `number` inside the icon, or restores the plain glyph with `None`.
+    ///
+    /// Called when the desktop changes while the indicator lives in the
+    /// notification area. Safe to call before [`Self::register`]: the handle is
+    /// swapped and the shell is only told once the icon exists.
+    pub fn set_badge(&mut self, number: Option<usize>) {
+        if self.badge == number {
+            return;
+        }
+        self.badge = number;
+
+        let size = Self::icon_size();
+        let light = is_light_theme();
+        let new_hicon = Self::get_hicon(size, light, number);
+        let old_hicon = self.data.hIcon;
+        self.data.hIcon = new_hicon;
+        self.icon_key = (size, light, number);
+
+        unsafe {
+            if !self.data.hWnd.is_invalid() {
+                let _ = Shell_NotifyIconW(NIM_MODIFY, &self.data);
+            }
+            let _ = DestroyIcon(old_hicon);
+        }
+        debug!("TrayIcon badge updated ({number:?})");
     }
 
     /// Rebuilds the icon when the tray's size or the system theme no longer matches what the
@@ -62,14 +92,14 @@ impl TrayIcon {
     pub fn resync(&mut self) {
         let size = Self::icon_size();
         let light = is_light_theme();
-        if self.icon_key == (size, light) {
+        if self.icon_key == (size, light, self.badge) {
             return;
         }
 
-        let new_hicon = Self::get_hicon(size, light);
+        let new_hicon = Self::get_hicon(size, light, self.badge);
         let old_hicon = self.data.hIcon;
         self.data.hIcon = new_hicon;
-        self.icon_key = (size, light);
+        self.icon_key = (size, light, self.badge);
 
         unsafe {
             // `NIM_MODIFY` needs a registered icon; at startup the window handle is still null.
@@ -154,12 +184,14 @@ impl TrayIcon {
     /// the requested size, which would upscale the 16 px artwork at every other DPI. The entry
     /// closest to `size` is decoded at exactly `size`, preferring the larger one on a tie so an
     /// unusual DPI scales down rather than up.
-    fn get_hicon(size: i32, light: bool) -> HICON {
-        let bytes = if light {
-            ICON_LIGHT_BYTES
-        } else {
-            ICON_DARK_BYTES
-        };
+    fn get_hicon(size: i32, light: bool, badge: Option<usize>) -> HICON {
+        if let Some(number) = badge {
+            if let Some(icon) = super::tray_badge::build(size, light, number) {
+                return icon;
+            }
+        }
+
+        let bytes = Self::artwork_bytes(light);
         let (_, offset, length) =
             Self::pick_entry(bytes, size).expect("embedded tray icon has no usable entry");
         unsafe {
@@ -173,6 +205,20 @@ impl TrayIcon {
             )
             .expect("Failed to decode embedded tray icon")
         }
+    }
+
+    /// ICO bytes of the light or dark tray artwork.
+    pub(super) fn artwork_bytes(light: bool) -> &'static [u8] {
+        if light {
+            ICON_LIGHT_BYTES
+        } else {
+            ICON_DARK_BYTES
+        }
+    }
+
+    /// `(offset, length)` of the ICO entry closest to `size`, for the badge renderer.
+    pub(super) fn artwork_entry(size: i32, light: bool) -> Option<(usize, usize)> {
+        Self::pick_entry(Self::artwork_bytes(light), size).map(|(_, offset, length)| (offset, length))
     }
 
     /// Returns `(dimension, offset, length)` of the ICO entry closest to `size`.
