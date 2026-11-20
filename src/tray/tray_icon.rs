@@ -398,8 +398,8 @@ mod tests {
     #[test]
     fn every_entry_decodes_at_the_requested_size() {
         for size in [16, 20, 24, 28, 32, 40, 48] {
-            assert_eq!(hicon_size(TrayIcon::get_hicon(size, true)), (size, size));
-            assert_eq!(hicon_size(TrayIcon::get_hicon(size, false)), (size, size));
+            assert_eq!(hicon_size(TrayIcon::get_hicon(size, true, None)), (size, size));
+            assert_eq!(hicon_size(TrayIcon::get_hicon(size, false, None)), (size, size));
         }
     }
 }
