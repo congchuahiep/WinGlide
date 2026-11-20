@@ -28,13 +28,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSE_EVENT_FLAGS, MOUSEINPUT, VK_MENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, GetCursorPos, GetForegroundWindow, GetSystemMetrics,
+    BringWindowToTop, GetClassNameW, GetCursorPos, GetForegroundWindow, GetSystemMetrics,
     GetWindowThreadProcessId, IsIconic, SetCursorPos, SetForegroundWindow, ShowWindowAsync,
-    SwitchToThisWindow, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SW_RESTORE,
+    SwitchToThisWindow, WindowFromPoint, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_RESTORE,
 };
 
 use super::logical_window::LogicalWindow;
+use crate::shared::integrity;
 
 /// How long to wait for a step to take effect before trying the next one.
 const STEP_TIMEOUT: Duration = Duration::from_millis(90);
@@ -75,6 +76,12 @@ pub fn activate(target: &LogicalWindow, button_rect: Option<RECT>) -> Option<Act
 
         restore_if_minimized(target);
 
+        // The ALT tap injects a keystroke into whatever is currently in the foreground.
+        // If that window is elevated (or its integrity cannot be determined), UIPI will
+        // block or redirect the injection, so skip that step instead of risking a
+        // keystroke landing in an elevated terminal.
+        let foreground_elevated = integrity::is_window_elevated(GetForegroundWindow());
+
         let _ = SetForegroundWindow(target.primary);
         if wait_until_foreground(target, STEP_TIMEOUT) {
             return Some(ActivationMethod::SetForegroundWindow);
@@ -90,10 +97,14 @@ pub fn activate(target: &LogicalWindow, button_rect: Option<RECT>) -> Option<Act
             return Some(ActivationMethod::SwitchToThisWindow);
         }
 
-        tap_alt();
-        let _ = SetForegroundWindow(target.primary);
-        if wait_until_foreground(target, STEP_TIMEOUT) {
-            return Some(ActivationMethod::AltUnlock);
+        if foreground_elevated == Some(false) {
+            tap_alt();
+            let _ = SetForegroundWindow(target.primary);
+            if wait_until_foreground(target, STEP_TIMEOUT) {
+                return Some(ActivationMethod::AltUnlock);
+            }
+        } else {
+            debug!("Skipping the ALT tap: the foreground is elevated or its integrity is unknown");
         }
 
         if let Some(rect) = button_rect {
@@ -176,8 +187,9 @@ fn attach_and_raise(target: &LogicalWindow) {
 /// Taps ALT, which makes Windows unlock `SetForegroundWindow` (see `LockSetForegroundWindow`).
 fn tap_alt() {
     let inputs = [alt_input(false), alt_input(true)];
-    unsafe {
-        SendInput(&inputs, size_of::<INPUT>() as i32);
+    let inserted = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
+    if inserted != inputs.len() as u32 {
+        debug!("ALT tap blocked ({inserted}/2 events inserted); UIPI or input lock");
     }
 }
 
@@ -213,6 +225,19 @@ fn click_button(rect: RECT) -> bool {
     let y = rect.top + (rect.bottom - rect.top) / 2;
     if !is_on_virtual_screen(x, y) {
         debug!("Taskbar button is off-screen at ({x}, {y}); not clicking");
+        return false;
+    }
+
+    // The button's rectangle comes from UIA, but the taskbar may have auto-hidden or
+    // moved since. Only click when the point is really over the taskbar, so a stale
+    // rectangle can never turn the fallback into a click inside the target window
+    // (which matters most for elevated terminals).
+    let under = unsafe { WindowFromPoint(POINT { x, y }) };
+    let class = window_class(under);
+    if !is_taskbar_class(&class) {
+        debug!(
+            "Not clicking at ({x}, {y}): the window under the point is '{class}', not the taskbar"
+        );
         return false;
     }
 
@@ -271,6 +296,28 @@ fn is_on_virtual_screen(x: i32, y: i32) -> bool {
     }
 }
 
+fn window_class(hwnd: HWND) -> String {
+    let mut buffer = [0u16; 256];
+    let length = unsafe { GetClassNameW(hwnd, &mut buffer) };
+    if length == 0 {
+        String::new()
+    } else {
+        String::from_utf16_lossy(&buffer[..length as usize])
+    }
+}
+
+/// Taskbar windows (and the XAML island hosted inside them) are the only valid click
+/// targets for the activation fallback.
+fn is_taskbar_class(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "MSTaskSwWClass"
+            | "Windows.UI.Composition.DesktopWindowContentBridge"
+    )
+}
+
 /// Kept for callers that only have a raw handle, e.g. the virtual-desktop jump path.
 #[instrument(level = "debug", skip_all)]
 pub(crate) unsafe fn force_activate(hwnd: HWND) -> bool {
@@ -309,5 +356,22 @@ pub(crate) unsafe fn force_activate(hwnd: HWND) -> bool {
     }
 
     GetForegroundWindow() == hwnd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_taskbar_class;
+
+    #[test]
+    fn only_taskbar_classes_are_click_targets() {
+        assert!(is_taskbar_class("Shell_TrayWnd"));
+        assert!(is_taskbar_class("Shell_SecondaryTrayWnd"));
+        assert!(is_taskbar_class("MSTaskSwWClass"));
+        assert!(is_taskbar_class(
+            "Windows.UI.Composition.DesktopWindowContentBridge"
+        ));
+        assert!(!is_taskbar_class("CASCADIA_HOSTING_WINDOW_CLASS"));
+        assert!(!is_taskbar_class(""));
+    }
 }
 
