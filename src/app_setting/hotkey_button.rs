@@ -5,7 +5,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, WH_KEYBOARD_LL,
 };
-use windows_reactor::{button, Element, RenderCx};
+use windows_reactor::{Button, ButtonStyle, ContentControl, IntoUnitCallback, View};
 
 const WM_KEYDOWN: u32 = 0x0100;
 const WM_SYSKEYDOWN: u32 = 0x0104;
@@ -18,41 +18,35 @@ thread_local! {
     static MODIFIERS_STATE: RefCell<u32> = RefCell::new(0);
 }
 
-/// The hotkey to display and capture.
+/// The hotkey button: the combination as text, or the capture prompt while the
+/// user is pressing keys.
+///
+/// The "listening" state is *not* held here. A `WH_KEYBOARD_LL` hook swallows the
+/// keyboard while it is installed and only one can exist, so the parent component
+/// owns which slot is capturing and starts the capture itself (see
+/// [`capture_hotkey`]); a second click on the other button can then never leave a
+/// button stuck on "Listening..." with no hook behind it.
 ///
 /// # Args
-/// - `hotkey`: `(modifiers, virtual key code)`
-pub fn render_hotkey_button(
+/// - `hotkey`: `(modifiers, virtual key code)` to display
+/// - `listening`: whether this slot is the one being captured
+pub fn hotkey_button(
     hotkey: (u32, u32),
     enabled: bool,
-    on_capture: impl Fn(u32, u32) + 'static,
-    cx: &mut RenderCx,
-) -> Element {
-    let (is_listening, set_listening) = cx.use_state(false);
-    let on_capture = std::rc::Rc::new(on_capture);
-
-    if is_listening {
-        button("Listening... (Press Esc to cancel)")
-            .accent()
-            .enabled(enabled)
-            .into()
+    listening: bool,
+    on_click: impl IntoUnitCallback,
+) -> View {
+    let label = if listening {
+        "Listening... (Press Esc to cancel)".to_string()
     } else {
-        button(format_hotkey(hotkey.0, hotkey.1))
-            .accent()
-            .enabled(enabled)
-            .on_click(move || {
-                set_listening.call(true);
-                let set_listening_clone = set_listening.clone();
-                let on_capture_clone = on_capture.clone();
-                capture_hotkey(move |result| {
-                    if let Some((mods, vk)) = result {
-                        on_capture_clone(mods, vk);
-                    }
-                    set_listening_clone.call(false);
-                });
-            })
-            .into()
-    }
+        format_hotkey(hotkey.0, hotkey.1)
+    };
+
+    Button::new()
+        .style(ButtonStyle::Accent)
+        .is_enabled(enabled)
+        .on_click(on_click)
+        .content(label)
 }
 
 /// Captures hotkeys from the user via a Global Keyboard Hook (WH_KEYBOARD_LL).

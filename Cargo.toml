@@ -26,10 +26,7 @@ tracing-appender = "0.2"
 tracing-forest = { version = "0.3.1", features = ["ansi", "smallvec"] }
 tracing-subscriber = { version = "0.3", features = ["fmt", "json"] }
 windows-core = "0.61"
-windows-reactor = {
-  git = "https://github.com/microsoft/windows-rs",
-  branch = "master"
-}
+windows-reactor = "0.100"
 winvd = "0.0.49"
 
 [dependencies.windows]
@@ -73,7 +70,4 @@ store = []
 
 [build-dependencies]
 winresource = "0.1"
-windows-reactor-setup = {
-  git = "https://github.com/microsoft/windows-rs",
-  branch = "master"
-}
+windows-reactor-setup = "0.100"

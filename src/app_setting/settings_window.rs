@@ -1,11 +1,16 @@
-//! The main Settings window: builds the layout from the feature sections
-//! (taskbar, virtual desktop, system) and drives config persistence.
+//! The Settings window: a `Component` that edits [`AppConfig`] row by row.
 //!
-//! Also owns the IPC helper that pokes the background app to reload its config
-//! and the process job object that ties the UI process to the background one.
+//! Every change takes the same path - [`Settings::apply`]: re-read the config from
+//! disk, apply the change, save it, then poke the background app so it reloads.
+//! Re-reading instead of mutating a copy captured at render time is what the old
+//! handlers did by hand; here it is one helper, so a change can never be computed
+//! from a stale `AppConfig`.
+//!
+//! This module also owns the IPC helper that pokes the background app and the job
+//! object that ties the UI process to it.
 
 use crate::app_setting::hotkey_button;
-use crate::app_setting::setting_item::{setting_item, SettingItemProps};
+use crate::app_setting::setting_item::SettingItem;
 use crate::app_setting::AppConfig;
 use std::os::windows::io::AsRawHandle;
 use windows::Win32::Foundation::HANDLE;
@@ -14,7 +19,7 @@ use windows::Win32::System::JobObjects::{
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::*;
+use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, MOD_WIN};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows_core::w;
@@ -39,573 +44,503 @@ fn send_reload_signal() {
     }
 }
 
-/// Main frame of the Settings App.
-/// Consists of a flow (`vstack`) containing all content blocks, padded evenly around.
-pub fn settings_app(cx: &mut RenderCx) -> Element {
-    let mut sections: Vec<Element> = vec![
-        header(),
-        taskbar_settings(cx),
-        virtual_desktop_settings(cx),
-        system_settings(cx),
-    ];
-    // The Microsoft Store build compiles the updater out entirely: Windows updates
-    // the package, and offering a GitHub download inside a Store app is against
-    // Store policy.
-    #[cfg(feature = "updater")]
-    sections.push(update_settings(cx));
-    sections.push(footer());
-
-    let content = vstack(sections).spacing(32.0).margin(24.0);
-
-    scroll_viewer(content).into()
+/// The two hotkey slots, so a capture can be attributed to one of them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CycleHotkey {
+    Left,
+    Right,
 }
 
-/// Header block displaying the main Title and Description of the App.
-fn header() -> Element {
-    vstack((title("Settings"),)).spacing(12.0).into()
-}
-
-/// Section containing settings related to the Taskbar.
-/// Note: `cx: &mut RenderCx` is passed directly down to `setting_item` instead of
-/// using the `component(setting_item)` wrapper, to ensure the Reconciler of
-/// `windows-reactor` can fully evaluate state changes, preventing skip render errors
-/// when the component is wrapped in a static `vstack`.
-fn taskbar_settings(cx: &mut RenderCx) -> Element {
-    let (config, set_config) = cx.use_state(AppConfig::load());
-
-    vstack((
-        body_strong("Taskbar").margin(Thickness {
-            bottom: 10.,
-            ..Default::default()
-        }),
-        setting_item(
-            &SettingItemProps {
-                icon: Some('\u{E7C4}'),
-                title: Some("Uncombine taskbar buttons".into()),
-                description: Some("Disallow group windows on the taskbar".into()),
-                action: Some(
-                    ToggleSwitch::new(config.uncombine_mode)
-                        .enabled(!config.cycle_taskbar_based)
-                        .on_content("")
-                        .off_content("")
-                        .width(42.)
-                        .min_width(0.0)
-                        .on_changed({
-                            let set_config = set_config.clone();
-                            move |is_on: bool| {
-                                let mut new_config = crate::app_setting::AppConfig::load();
-                                if new_config.uncombine_mode == is_on { return; }
-                                new_config.uncombine_mode = is_on;
-                                new_config.save();
-                                set_config.call(new_config);
-                                send_reload_signal();
-                            }
-                        })
-                        .into(),
-                ),
-                children: None, always_expand: false, enabled: true,
-            },
-            cx,
-        ),
-        setting_item(
-            &SettingItemProps {
-                icon: Some('\u{E8AB}'),
-                title: Some("Cycle taskbar buttons".into()),
-                description: Some("Switch windows based on taskbar buttons".into()),
-                action: Some(
-                    ToggleSwitch::new(config.cycle_taskbar_based)
-                        .on_content("")
-                        .off_content("")
-                        .width(42.)
-                        .min_width(0.0)
-                        .on_changed({
-                            let set_config = set_config.clone();
-                            move |is_on: bool| {
-                                let mut new_config = crate::app_setting::AppConfig::load();
-                                if new_config.cycle_taskbar_based == is_on { return; }
-                                new_config.cycle_taskbar_based = is_on;
-                                if is_on {
-                                    new_config.uncombine_mode = true;
-                                }
-                                new_config.save();
-                                set_config.call(new_config);
-                                send_reload_signal();
-                            }
-                        })
-                        .into(),
-                ),
-                always_expand: true, enabled: true,
-                children: Some(vec![
-                    SettingItemProps {
-                        icon: None,
-                        title: None,
-                        description: Some("By default, 'Cycle taskbar buttons' automatically uncombines buttons because it handles button groups poorly".into()),
-                        action: None,
-                        children: None, always_expand: false, enabled: config.cycle_taskbar_based,
-                    },
-                    SettingItemProps {
-                        icon: None,
-                        title: Some("Cycle left".into()),
-                        description: None,
-                        action: Some(hotkey_button::render_hotkey_button(
-                            (config.hotkey_left_modifiers, config.hotkey_left_vk),
-                            config.cycle_taskbar_based,
-                            {
-                                let set_config = set_config.clone();
-                                let config_state = config.clone();
-                                move |mods, vk| {
-                                    let mut new_config = config_state.clone();
-
-                                    // Handle conflict: swap if the other uses the same hotkey
-                                    if new_config.hotkey_right_modifiers == mods
-                                        && new_config.hotkey_right_vk == vk
-                                    {
-                                        new_config.hotkey_right_modifiers =
-                                            new_config.hotkey_left_modifiers;
-                                        new_config.hotkey_right_vk = new_config.hotkey_left_vk;
-                                    }
-
-                                    new_config.hotkey_left_modifiers = mods;
-                                    new_config.hotkey_left_vk = vk;
-                                    new_config.save();
-                                    set_config.call(new_config);
-                                    send_reload_signal();
-                                }
-                            },
-                            cx,
-                        )),
-                        children: None, always_expand: false, enabled: config.cycle_taskbar_based,
-                    },
-                    SettingItemProps {
-                        icon: None,
-                        title: Some("Cycle right".into()),
-                        description: None,
-                        action: Some(hotkey_button::render_hotkey_button(
-                            (config.hotkey_right_modifiers, config.hotkey_right_vk),
-                            config.cycle_taskbar_based,
-                            {
-                                let set_config = set_config.clone();
-                                let config_state = config.clone();
-                                move |mods, vk| {
-                                    let mut new_config = config_state.clone();
-
-                                    // Handle conflict: swap if the other uses the same hotkey
-                                    if new_config.hotkey_left_modifiers == mods
-                                        && new_config.hotkey_left_vk == vk
-                                    {
-                                        new_config.hotkey_left_modifiers =
-                                            new_config.hotkey_right_modifiers;
-                                        new_config.hotkey_left_vk = new_config.hotkey_right_vk;
-                                    }
-
-                                    new_config.hotkey_right_modifiers = mods;
-                                    new_config.hotkey_right_vk = vk;
-                                    new_config.save();
-                                    set_config.call(new_config);
-                                    send_reload_signal();
-                                }
-                            },
-                            cx,
-                        )),
-                        children: None, always_expand: false, enabled: config.cycle_taskbar_based,
-                    },
-                ]),
-            },
-            cx,
-        ),
-    ))
-    .spacing(4.0)
-    .into()
-}
-
-fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
-    let (config, set_config) = cx.use_state(AppConfig::load());
-
-    // Initialize flags for toggle buttons
-    let has_ctrl = config.jump_desktop_modifiers & MOD_CONTROL.0 != 0;
-    let has_alt = config.jump_desktop_modifiers & MOD_ALT.0 != 0;
-    let has_win = config.jump_desktop_modifiers & MOD_WIN.0 != 0;
-
-    let update_modifier = {
-        let set_config = set_config.clone();
-        std::rc::Rc::new(move |mod_flag: u32, is_checked: bool| {
-            // Load fresh config: native controls can keep a stale handler after
-            // re-renders, so never compute from captured state.
-            let mut new_config = crate::app_setting::AppConfig::load();
-            if is_checked {
-                new_config.jump_desktop_modifiers |= mod_flag;
-            } else {
-                new_config.jump_desktop_modifiers &= !mod_flag;
-            }
-            new_config.save();
-            set_config.call(new_config);
-            send_reload_signal();
-        })
-    };
-
-    let ctrl_btn = toggle_button("Ctrl", has_ctrl).on_changed({
-        let update_modifier = update_modifier.clone();
-        move |checked| update_modifier(MOD_CONTROL.0, checked)
-    });
-    let alt_btn = toggle_button("Alt", has_alt).on_changed({
-        let update_modifier = update_modifier.clone();
-        move |checked| update_modifier(MOD_ALT.0, checked)
-    });
-    let win_btn = toggle_button("Win", has_win).on_changed({
-        let update_modifier = update_modifier.clone();
-        move |checked| update_modifier(MOD_WIN.0, checked)
-    });
-
-    let jump_modifiers_action = hstack((ctrl_btn, alt_btn, win_btn))
-        .spacing(2.0)
-        .margin(Thickness {
-            right: 10.,
-            ..Default::default()
-        })
-        .vertical_alignment(VerticalAlignment::Center);
-
-    // Indicator placement: a compact DropDownButton showing the current
-    // preset, with a flyout to pick Auto / Left / Right.
-    let position_label = match config.indicator_position {
-        1 => "Left",
-        2 => "Right",
-        _ => "Auto",
-    };
-    let position_action: Element = drop_down_button(position_label)
-        .menu_flyout(vec![
-            menu_item("Auto"),
-            menu_item("Left"),
-            menu_item("Right"),
-        ])
-        .on_flyout_item_click({
-            let set_config = set_config.clone();
-            move |text: String| {
-                let new_pos = match text.as_str() {
-                    "Left" => 1,
-                    "Right" => 2,
-                    _ => 0,
-                };
-                // Load fresh config: the flyout keeps a stale handler after
-                // re-renders (items unchanged => reactor skips rewiring), so
-                // relying on captured state makes re-selecting the initial
-                // value a no-op.
-                let mut new_config = crate::app_setting::AppConfig::load();
-                if new_pos == new_config.indicator_position {
-                    return;
-                }
-                new_config.indicator_position = new_pos;
-                new_config.save();
-                set_config.call(new_config);
-                send_reload_signal();
-            }
-        })
-        .into();
-    let position_action = position_action.margin(Thickness {
-        right: 10.,
-        ..Default::default()
-    });
-
-    // Tray badge: the desktop number drawn on the notification-area icon. It is a
-    // setting of its own, independent of the on-taskbar dots.
-    let tray_badge_action: Element = ToggleSwitch::new(config.tray_badge)
-        .on_content("")
-        .off_content("")
-        .min_width(0.0)
-        .width(42.)
-        .on_changed({
-            let set_config = set_config.clone();
-            move |checked| {
-                let mut new_config = crate::app_setting::AppConfig::load();
-                new_config.tray_badge = checked;
-                new_config.save();
-                set_config.call(new_config);
-                send_reload_signal();
-            }
-        })
-        .into();
-
-    let accent_action: Element = ToggleSwitch::new(config.indicator_accent_color)
-        .on_content("")
-        .off_content("")
-        .min_width(0.0)
-        .width(42.)
-        .on_changed({
-            let set_config = set_config.clone();
-            move |checked| {
-                let mut new_config = crate::app_setting::AppConfig::load();
-                new_config.indicator_accent_color = checked;
-                new_config.save();
-                set_config.call(new_config);
-                send_reload_signal();
-            }
-        })
-        .into();
-
-    let background_action: Element = ToggleSwitch::new(config.indicator_background)
-        .on_content("")
-        .off_content("")
-        .min_width(0.0)
-        .width(42.)
-        .on_changed({
-            let set_config = set_config.clone();
-            move |checked| {
-                let mut new_config = crate::app_setting::AppConfig::load();
-                new_config.indicator_background = checked;
-                new_config.save();
-                set_config.call(new_config);
-                send_reload_signal();
-            }
-        })
-        .into();
-
-    vstack((
-        body_strong("Virtual Desktop").margin(Thickness {
-            bottom: 10.,
-            ..Default::default()
-        }),
-        setting_item(
-            &SettingItemProps {
-                icon: Some('\u{E712}'),
-                title: Some("Desktop Indicator".into()),
-                description: Some("Show the virtual desktop indicator on the taskbar".into()),
-                action: Some(
-                    ToggleSwitch::new(config.desktop_indicator)
-                        .on_content("")
-                        .off_content("")
-                        .min_width(0.0)
-                        .width(42.)
-                        .on_changed({
-                            let set_config = set_config.clone();
-                            move |checked| {
-                                let mut new_config = crate::app_setting::AppConfig::load();
-                                new_config.desktop_indicator = checked;
-                                new_config.save();
-                                set_config.call(new_config);
-                                send_reload_signal();
-                            }
-                        })
-                        .into(),
-                ),
-                children: Some(vec![SettingItemProps {
-                    icon: None,
-                    title: None,
-                    description: Some(
-                        "Click a dot to switch to that desktop. Hold Alt + click to move the current window there. Right-click a dot to open a 'Move to Desktop' menu".into(),
-                    ),
-                    action: None,
-                    children: None,
-                    always_expand: false,
-                    enabled: config.desktop_indicator,
-                }, SettingItemProps {
-                    icon: None,
-                    title: Some("Position".into()),
-                    description: Some("Placement of the indicator on the taskbar".into()),
-                    action: Some(position_action.into()),
-                    children: None,
-                    always_expand: false,
-                    enabled: config.desktop_indicator,
-                }, SettingItemProps {
-                    icon: None,
-                    title: Some("Accent Color".into()),
-                    description: Some(
-                        "Use the Windows accent color for the dots".into(),
-                    ),
-                    action: Some(accent_action),
-                    children: None,
-                    always_expand: false,
-                    enabled: config.desktop_indicator,
-                }, SettingItemProps {
-                    icon: None,
-                    title: Some("Background".into()),
-                    description: Some("Draw a translucent background behind the dots".into()),
-                    action: Some(background_action),
-                    children: None,
-                    always_expand: false,
-                    enabled: config.desktop_indicator,
-                }]),
-                always_expand: true,
-                enabled: true,
-            },
-            cx,
-        ),
-        setting_item(
-            &SettingItemProps {
-                icon: Some('\u{EC1B}'),
-                title: Some("Tray Icon Badge".into()),
-                description: Some(
-                    "Draw the current desktop number on the tray icon".into(),
-                ),
-                action: Some(tray_badge_action),
-                children: None,
-                always_expand: false,
-                enabled: true,
-            },
-            cx,
-        ),
-        setting_item(
-            &SettingItemProps {
-                icon: Some('\u{E7B5}'),
-                title: Some("Jump to Desktop".into()),
-                description: Some("Change the desktop by index. e.g Alt+1, Alt+2".into()),
-                action: Some(jump_modifiers_action.into()),
-                children: None,
-                always_expand: false,
-                enabled: true,
-            },
-            cx,
-        ),
-    ))
-    .spacing(4.0)
-    .into()
-}
-
-fn system_settings(cx: &mut RenderCx) -> Element {
-    let (autostart, set_autostart) = cx.use_state(crate::app::autostart::is_autostart_enabled());
-
-    vstack((
-        body_strong("System").margin(Thickness {
-            bottom: 10.,
-            ..Default::default()
-        }),
-        setting_item(
-            &SettingItemProps {
-                icon: Some('\u{E7E8}'),
-                title: Some("Start with Windows".into()),
-                description: Some("Automatically run this app when you log in".into()),
-                action: Some(
-                    ToggleSwitch::new(autostart)
-                        .on_content("")
-                        .off_content("")
-                        .min_width(0.0)
-                        .width(42.)
-                        .on_changed({
-                            move |checked| {
-                                match crate::app::autostart::set_autostart(checked) {
-                                    Ok(()) => set_autostart.call(checked),
-                                    // Windows can refuse (a packaged app the user
-                                    // disabled in Task Manager); say so in the log
-                                    // instead of showing a toggle that does nothing.
-                                    Err(e) => tracing::warn!("autostart: {e}"),
-                                }
-                            }
-                        })
-                        .into(),
-                ),
-                children: None,
-                always_expand: false,
-                enabled: true,
-            },
-            cx,
-        ),
-    ))
-    .spacing(4.0)
-    .into()
-}
-
-/// Section containing the update check. Compiled out of the Store build.
+/// State of the update check. Compiled out of the Store build, which updates
+/// through Windows and may not offer a GitHub download.
 #[cfg(feature = "updater")]
-fn update_settings(cx: &mut RenderCx) -> Element {
-    let (update_info, set_update_info) =
-        cx.use_async_state::<Option<crate::app::update_checker::UpdateInfo>>(None);
-    let (checking, set_checking) = cx.use_async_state(false);
-
-    vstack((
-        body_strong("Updates").margin(Thickness {
-            bottom: 10.,
-            ..Default::default()
-        }),
-        setting_item(
-            &SettingItemProps {
-                icon: Some('\u{E895}'),
-                title: Some("Check for updates".into()),
-                description: Some(if checking {
-                    "Checking...".into()
-                } else if let Some(info) = update_info.as_ref() {
-                    format!("New version {} is available!", info.latest_version)
-                } else {
-                    format!("Current version: {}", env!("CARGO_PKG_VERSION"))
-                }),
-                action: Some(if update_info.is_some() {
-                    button("Update Now")
-                        .on_click(|| unsafe {
-                            let releases = windows::core::HSTRING::from(
-                                crate::app::update_checker::RELEASES_URL,
-                            );
-                            ShellExecuteW(None, w!("open"), &releases, None, None, SW_SHOWNORMAL);
-                        })
-                        .into()
-                } else {
-                    button("Check")
-                        .enabled(!checking)
-                        .on_click({
-                            let set_checking = set_checking.clone();
-                            let set_update_info = set_update_info.clone();
-                            move || {
-                                set_checking.call(true);
-                                let set_checking_clone = set_checking.clone();
-                                let set_update_info_clone = set_update_info.clone();
-                                std::thread::spawn(move || {
-                                    if let Ok(Some(info)) =
-                                        crate::app::update_checker::check_for_updates()
-                                    {
-                                        set_update_info_clone.call(Some(info));
-                                    }
-                                    set_checking_clone.call(false);
-                                });
-                            }
-                        })
-                        .into()
-                }),
-                children: None,
-                always_expand: false,
-                enabled: true,
-            },
-            cx,
-        ),
-    ))
-    .spacing(4.0)
-    .into()
+#[derive(Default)]
+struct UpdateCheck {
+    checking: bool,
+    /// Version of the newest release, once a check has found one.
+    available: Option<String>,
 }
 
-/// Footer block displaying author information and Repository.
-fn footer() -> Element {
-    vstack((
-        body_strong("About"),
-        body(format!("Version: {}", env!("CARGO_PKG_VERSION"))),
-        body("Author: @congchuahiep"),
-        button("GitHub Repository").on_click(|| unsafe {
-            ShellExecuteW(
-                None,
-                w!("open"),
-                w!("https://github.com/congchuahiep/WinGlide"),
-                None,
-                None,
-                SW_SHOWNORMAL,
-            );
-        }),
+#[derive(Clone)]
+enum Message {
+    UncombineChanged(bool),
+    CycleTaskbarChanged(bool),
+    StartCapture(CycleHotkey),
+    Captured(CycleHotkey, Option<(u32, u32)>),
+    DesktopIndicatorChanged(bool),
+    IndicatorPositionChanged(Option<usize>),
+    AccentColorChanged(bool),
+    BackgroundChanged(bool),
+    TrayBadgeChanged(bool),
+    JumpModifierChanged(u32, bool),
+    AutostartChanged(bool),
+    #[cfg(feature = "updater")]
+    CheckForUpdates,
+    #[cfg(feature = "updater")]
+    UpdateChecked(Option<String>),
+}
+
+struct Settings {
+    config: AppConfig,
+    autostart: bool,
+    /// Which cycle hotkey is being captured, if any. Owned here because a
+    /// `WH_KEYBOARD_LL` hook is a process-wide singleton: one capture at a time,
+    /// and the buttons only reflect it.
+    listening: Option<CycleHotkey>,
+    #[cfg(feature = "updater")]
+    update: UpdateCheck,
+}
+
+impl Settings {
+    /// Applies one change to the persisted config and tells the background app.
+    ///
+    /// Loading first (rather than mutating the copy rendered last) keeps this window
+    /// from overwriting an edit the file received in the meantime.
+    fn apply(&mut self, change: impl FnOnce(&mut AppConfig)) {
+        let mut config = AppConfig::load();
+        change(&mut config);
+        config.save();
+        self.config = config;
+        send_reload_signal();
+    }
+
+    fn taskbar_section(&self, context: &ViewContext<Self>) -> View {
+        // One cycle button: the combination it holds, and a capture while it is the
+        // slot being listened to.
+        let cycle = |slot: CycleHotkey, title: &str| {
+            let (modifiers, vk) = match slot {
+                CycleHotkey::Left => (
+                    self.config.hotkey_left_modifiers,
+                    self.config.hotkey_left_vk,
+                ),
+                CycleHotkey::Right => (
+                    self.config.hotkey_right_modifiers,
+                    self.config.hotkey_right_vk,
+                ),
+            };
+            SettingItem::new(title)
+                .enabled(self.config.cycle_taskbar_based)
+                .action(hotkey_button::hotkey_button(
+                    (modifiers, vk),
+                    self.config.cycle_taskbar_based,
+                    self.listening == Some(slot),
+                    context.message(Message::StartCapture(slot)),
+                ))
+        };
+
+        StackPanel::new().spacing(4.0).children((
+            section_title("Taskbar"),
+            SettingItem::new("Uncombine taskbar buttons")
+                .icon('\u{E7C4}')
+                .description("Disallow group windows on the taskbar")
+                .action(toggle(
+                    self.config.uncombine_mode,
+                    // Cycling forces uncombining, so the switch is not the
+                    // user's to move while cycling is on.
+                    !self.config.cycle_taskbar_based,
+                    Message::UncombineChanged,
+                    context,
+                )),
+            SettingItem::new("Cycle taskbar buttons")
+                .icon('\u{E8AB}')
+                .description("Switch windows based on taskbar buttons")
+                .action(toggle(
+                    self.config.cycle_taskbar_based,
+                    true,
+                    Message::CycleTaskbarChanged,
+                    context,
+                ))
+                .children([
+                    SettingItem::note("By default, 'Cycle taskbar buttons' automatically uncombines buttons because it handles button groups poorly")
+                        .enabled(self.config.cycle_taskbar_based),
+                    cycle(CycleHotkey::Left, "Cycle left"),
+                    cycle(CycleHotkey::Right, "Cycle right"),
+                ]),
+        ))
+    }
+
+    fn virtual_desktop_section(&self, context: &ViewContext<Self>) -> View {
+        let indicator = self.config.desktop_indicator;
+        // A config written by hand can hold anything; the old window showed such a
+        // value as Auto, so keep that instead of an empty picker.
+        let position = match self.config.indicator_position {
+            1 => 1,
+            2 => 2,
+            _ => 0,
+        };
+        // Ctrl / Alt / Win: the jump hotkey is whatever combination of these bits is
+        // set.
+        let modifier = |label: &str, flag: u32| {
+            ToggleButton::new()
+                .is_checked(self.config.jump_desktop_modifiers & flag != 0)
+                .on_is_checked_changed(
+                    context.callback(move |checked| Message::JumpModifierChanged(flag, checked)),
+                )
+                .content(label)
+        };
+
+        StackPanel::new().spacing(4.0).children((
+            section_title("Virtual Desktop"),
+            SettingItem::new("Desktop Indicator")
+                .icon('\u{E712}')
+                .description("Show the virtual desktop indicator on the taskbar")
+                .action(toggle(
+                    self.config.desktop_indicator,
+                    true,
+                    Message::DesktopIndicatorChanged,
+                    context,
+                ))
+                .children([
+                    SettingItem::note("Click a dot to switch to that desktop. Hold Alt + click to move the current window there. Right-click a dot to open a 'Move to Desktop' menu")
+                        .enabled(indicator),
+                    SettingItem::new("Position")
+                        .description("Placement of the indicator on the taskbar")
+                        .enabled(indicator)
+                        .action(
+                            ComboBox::new()
+                                .items_source(["Auto", "Left", "Right"])
+                                .selected_index(position)
+                                .is_enabled(indicator)
+                                .width(120.0)
+                                .margin(Thickness::new(0.0, 0.0, 10.0, 0.0))
+                                .on_selection_changed(
+                                    context.callback(Message::IndicatorPositionChanged),
+                                ),
+                        ),
+                    SettingItem::new("Accent Color")
+                        .description("Use the Windows accent color for the dots")
+                        .enabled(indicator)
+                        .action(toggle(
+                            self.config.indicator_accent_color,
+                            indicator,
+                            Message::AccentColorChanged,
+                            context,
+                        )),
+                    SettingItem::new("Background")
+                        .description("Draw a translucent background behind the dots")
+                        .enabled(indicator)
+                        .action(toggle(
+                            self.config.indicator_background,
+                            indicator,
+                            Message::BackgroundChanged,
+                            context,
+                        )),
+                ]),
+            SettingItem::new("Tray Icon Badge")
+                .icon('\u{EC1B}')
+                .description("Draw the current desktop number on the tray icon")
+                // Independent of the dots: the badge needs the indicator's
+                // desktop thread, not the indicator itself.
+                .action(toggle(
+                    self.config.tray_badge,
+                    true,
+                    Message::TrayBadgeChanged,
+                    context,
+                )),
+            SettingItem::new("Jump to Desktop")
+                .icon('\u{E7B5}')
+                .description("Change the desktop by index. e.g Alt+1, Alt+2")
+                .action(
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(2.0)
+                        .margin(Thickness::new(0.0, 0.0, 10.0, 0.0))
+                        .children((
+                            modifier("Ctrl", MOD_CONTROL.0),
+                            modifier("Alt", MOD_ALT.0),
+                            modifier("Win", MOD_WIN.0),
+                        )),
+                ),
+        ))
+    }
+
+    fn system_section(&self, context: &ViewContext<Self>) -> View {
+        StackPanel::new().spacing(4.0).children((
+            section_title("System"),
+            SettingItem::new("Start with Windows")
+                .icon('\u{E7E8}')
+                .description("Automatically run this app when you log in")
+                .action(toggle(
+                    self.autostart,
+                    true,
+                    Message::AutostartChanged,
+                    context,
+                )),
+        ))
+    }
+
+    #[cfg(feature = "updater")]
+    fn update_section(&self, context: &ViewContext<Self>) -> View {
+        let (description, action) = if let Some(version) = &self.update.available {
+            (
+                format!("New version {version} is available!"),
+                Button::new().on_click(open_releases).content("Update Now"),
+            )
+        } else if self.update.checking {
+            (
+                "Checking...".to_string(),
+                Button::new().is_enabled(false).content("Check"),
+            )
+        } else {
+            (
+                format!("Current version: {}", env!("CARGO_PKG_VERSION")),
+                Button::new()
+                    .is_enabled(true)
+                    .on_click(context.message(Message::CheckForUpdates))
+                    .content("Check"),
+            )
+        };
+
+        StackPanel::new().spacing(4.0).children((
+            section_title("Updates"),
+            SettingItem::new("Check for updates")
+                .icon('\u{E895}')
+                .description(description)
+                .action(action),
+        ))
+    }
+}
+
+impl Component for Settings {
+    type Message = Message;
+    type Input = ();
+
+    fn create(_input: &(), _context: &ComponentContext<Self>) -> Self {
+        Self {
+            config: AppConfig::load(),
+            autostart: crate::app::autostart::is_autostart_enabled(),
+            listening: None,
+            #[cfg(feature = "updater")]
+            update: UpdateCheck::default(),
+        }
+    }
+
+    fn update(&mut self, message: Message, context: &ComponentContext<Self>) {
+        match message {
+            Message::UncombineChanged(on) => {
+                self.apply(|config| config.uncombine_mode = on);
+            }
+            Message::CycleTaskbarChanged(on) => {
+                self.apply(|config| {
+                    config.cycle_taskbar_based = on;
+                    // Cycling walks taskbar buttons; grouped buttons have none to
+                    // walk, so turning cycling on uncombines.
+                    if on {
+                        config.uncombine_mode = true;
+                    }
+                });
+            }
+            Message::StartCapture(slot) => {
+                self.listening = Some(slot);
+                let captured = context
+                    .sender()
+                    .callback(move |result: Option<(u32, u32)>| Message::Captured(slot, result));
+                hotkey_button::capture_hotkey(move |result| {
+                    // The hook reports on this thread; the callback only queues.
+                    let _ = captured.call(result);
+                });
+            }
+            Message::Captured(slot, result) => {
+                self.listening = None;
+                if let Some((modifiers, vk)) = result {
+                    // Capturing what the other slot already uses swaps the two, so the
+                    // cycle hotkeys can never end up identical.
+                    self.apply(|config| match slot {
+                        CycleHotkey::Left => {
+                            if config.hotkey_right_modifiers == modifiers
+                                && config.hotkey_right_vk == vk
+                            {
+                                config.hotkey_right_modifiers = config.hotkey_left_modifiers;
+                                config.hotkey_right_vk = config.hotkey_left_vk;
+                            }
+                            config.hotkey_left_modifiers = modifiers;
+                            config.hotkey_left_vk = vk;
+                        }
+                        CycleHotkey::Right => {
+                            if config.hotkey_left_modifiers == modifiers
+                                && config.hotkey_left_vk == vk
+                            {
+                                config.hotkey_left_modifiers = config.hotkey_right_modifiers;
+                                config.hotkey_left_vk = config.hotkey_right_vk;
+                            }
+                            config.hotkey_right_modifiers = modifiers;
+                            config.hotkey_right_vk = vk;
+                        }
+                    });
+                }
+            }
+            Message::DesktopIndicatorChanged(on) => {
+                self.apply(|config| config.desktop_indicator = on);
+            }
+            // `None` means the picker was cleared, which the three fixed presets
+            // never offer; ignore it rather than saving a meaningless position.
+            Message::IndicatorPositionChanged(Some(position)) => {
+                self.apply(|config| config.indicator_position = position as u8);
+            }
+            Message::IndicatorPositionChanged(None) => {}
+            Message::AccentColorChanged(on) => {
+                self.apply(|config| config.indicator_accent_color = on);
+            }
+            Message::BackgroundChanged(on) => {
+                self.apply(|config| config.indicator_background = on);
+            }
+            Message::TrayBadgeChanged(on) => {
+                self.apply(|config| config.tray_badge = on);
+            }
+            Message::JumpModifierChanged(flag, checked) => {
+                self.apply(|config| {
+                    if checked {
+                        config.jump_desktop_modifiers |= flag;
+                    } else {
+                        config.jump_desktop_modifiers &= !flag;
+                    }
+                });
+            }
+            Message::AutostartChanged(on) => match crate::app::autostart::set_autostart(on) {
+                Ok(()) => self.autostart = on,
+                // Windows can refuse (a packaged app the user disabled in Task
+                // Manager); log it instead of showing a switch that lies.
+                Err(e) => tracing::warn!("autostart: {e}"),
+            },
+            #[cfg(feature = "updater")]
+            Message::CheckForUpdates => {
+                self.update.checking = true;
+                let _ = context.spawn_background(|_cancellation| {
+                    // reqwest blocking: off the UI thread, or the window stops
+                    // responding for the length of the request.
+                    let available = match crate::app::update_checker::check_for_updates() {
+                        Ok(info) => info.map(|info| info.latest_version),
+                        Err(e) => {
+                            tracing::warn!("update check failed: {e}");
+                            None
+                        }
+                    };
+                    Message::UpdateChecked(available)
+                });
+            }
+            #[cfg(feature = "updater")]
+            Message::UpdateChecked(available) => {
+                self.update.checking = false;
+                self.update.available = available;
+            }
+        }
+    }
+
+    fn view(&self, _input: &(), context: &mut ViewContext<Self>) -> View {
+        context.window_title("WinGlide");
+        context.window_visuals(
+            WindowVisuals::new()
+                .backdrop(WindowBackdrop::Mica)
+                .client_size(540.0, 720.0)
+                .constraints(WindowConstraints {
+                    min_width: Some(540.0),
+                    min_height: Some(540.0),
+                    max_width: None,
+                    max_height: None,
+                }),
+        );
+
+        // The Store build compiles the updater out entirely: Windows updates the
+        // package, and offering a GitHub download inside a Store app is against
+        // Store policy.
+        #[cfg(feature = "updater")]
+        let sections = (
+            header(),
+            self.taskbar_section(context),
+            self.virtual_desktop_section(context),
+            self.system_section(context),
+            self.update_section(context),
+            footer(),
+        );
+        #[cfg(not(feature = "updater"))]
+        let sections = (
+            header(),
+            self.taskbar_section(context),
+            self.virtual_desktop_section(context),
+            self.system_section(context),
+            footer(),
+        );
+
+        ScrollViewer::new().content(
+            StackPanel::new()
+                .spacing(32.0)
+                .margin(Thickness::uniform(24.0))
+                .children(sections),
+        )
+    }
+}
+
+/// A toggle switch wired to `message`, sized down to the 42px the rows reserve.
+fn toggle(
+    value: bool,
+    enabled: bool,
+    message: fn(bool) -> Message,
+    context: &ViewContext<Settings>,
+) -> View {
+    ToggleSwitch::new()
+        .is_on(value)
+        .is_enabled(enabled)
+        .width(42.0)
+        .min_width(0.0)
+        .on_toggled(context.callback(message))
+        // The switch's own "On"/"Off" text would push the row wider than it is.
+        .slots([
+            SlotView::new(ToggleSwitchSlot::OnContent, ""),
+            SlotView::new(ToggleSwitchSlot::OffContent, ""),
+        ])
+}
+
+fn header() -> View {
+    TextBlock::new()
+        .text("Settings")
+        .font_size(28.0)
+        .font_weight(FontWeight::SEMI_BOLD)
+        .into()
+}
+
+fn section_title(text: &str) -> View {
+    TextBlock::new()
+        .text(text)
+        .font_size(14.0)
+        .font_weight(FontWeight::SEMI_BOLD)
+        .margin(Thickness::new(0.0, 0.0, 0.0, 10.0))
+        .into()
+}
+
+fn footer() -> View {
+    StackPanel::new().spacing(8.0).children((
+        section_title("About"),
+        TextBlock::new().text("Author: congchuahiep"),
+        TextBlock::new().text(format!("Version: {}", env!("CARGO_PKG_VERSION"))),
+        Button::new()
+            .on_click(open_repository)
+            .content("GitHub Repository"),
     ))
-    .spacing(8.0)
-    .into()
+}
+
+fn open_repository() {
+    open_url(env!("CARGO_PKG_REPOSITORY"));
+}
+
+#[cfg(feature = "updater")]
+fn open_releases() {
+    open_url(crate::app::update_checker::RELEASES_URL);
+}
+
+fn open_url(url: &str) {
+    unsafe {
+        let url = windows::core::HSTRING::from(url);
+        ShellExecuteW(None, w!("open"), &url, None, None, SW_SHOWNORMAL);
+    }
 }
 
 /// Runs the settings UI application. Only run it in the main thread.
-pub fn run() -> Result<()> {
+pub fn run() -> anyhow::Result<()> {
     // WinUI 3 windows do not inherit the executable's icon; give the title bar one.
     super::window_icon::apply();
 
-    // let _bootstrap_handle = bootstrap::initialize()?;
-
-    App::new()
-        .title("WinGlide")
-        .backdrop(Backdrop::Mica)
-        .inner_size(540., 720.)
-        .inner_constraints(InnerConstraints {
-            min_width: Some(540.),
-            min_height: Some(540.),
-            max_width: None,
-            max_height: None,
-        })
-        .render(settings_app)
+    App::run_component::<Settings>(())?;
+    Ok(())
 }
 
 /// Opens the settings UI by spawning a new process.
