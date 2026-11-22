@@ -147,6 +147,7 @@ jobs:
         with:
           tag_name: v${{ needs.check-version.outputs.version }}
           name: WinGlide v${{ needs.check-version.outputs.version }}
+          generate_release_notes: true
           files: |
             target\wix\WinGlide-x86_64.msi
             target\wix\WinGlide-Portable-x86_64.zip
