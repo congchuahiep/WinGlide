@@ -2,7 +2,7 @@
 
 ## Project summary
 
-Rust (edition 2021) app for **Windows 11 only**, version 0.0.9. Single binary (`WinGlide.exe`), no workspace/monorepo. Features:
+Rust (edition 2021) app for **Windows 11 only**. Single binary (`WinGlide.exe`), no workspace/monorepo. Features:
 
 - Cycle through taskbar buttons via global hotkeys (`Alt+[` / `Alt+]`)
 - Uncombine taskbar buttons (unique AUMID per window)
@@ -197,11 +197,11 @@ shared/                     -> cross-cutting helpers used by more than one featu
 - `uncombine_mode: bool` (default true)
 - `cycle_taskbar_based: bool` (default true)
 - `hotkey_left_vk` / `hotkey_left_modifiers`, `hotkey_right_vk` / `hotkey_right_modifiers` (default Alt+`[` / Alt+`]`)
-- `desktop_indicator: bool` (default true)
+- `desktop_indicator: bool` (default true; the dots on the taskbar)
 - `indicator_position: u8` (0=Auto, 1=Left, 2=Right; serde default 0 so old configs keep parsing)
 - `indicator_accent_color: bool` (default true; paints the dots with `HKCU\Software\Microsoft\Windows\DWM\AccentColor` (ABGR DWORD), falling back to the theme color when that value is absent)
 - `indicator_background: bool` (default true; draws a translucent rounded pill behind the dot row)
-- `indicator_mode: u8` (default 0; 0 = dots on the taskbar, 2 = the desktop number drawn inside the tray icon; 1 is reserved for the automatic fallback, not implemented yet). Tray mode keeps the dot window hidden and repaints the tray icon on every desktop switch; `TrayIcon::set_badge` caches on `(size, theme, number)` and `tray_badge.rs` stamps the digit from a 3x5 pixel font (a hinted system font turns to mush at 16 px), so no per-number icon assets exist.
+- `tray_badge: bool` (default false; draws the current desktop number inside the tray icon). Independent of `desktop_indicator`, so both can be on at once. With only the badge on, the indicator window still exists - it owns the virtual-desktop event thread and hides itself in `render()` - because that thread is what repaints the number on every desktop switch. `TrayIcon::set_badge` caches on `(size, theme, number)` and `tray_badge.rs` stamps the digit from a 3x5 pixel font (a hinted system font turns to mush at 16 px), so no per-number icon assets exist. Configs written before the split stored this choice in `indicator_mode: 2`, which `load()` migrates once.
 - `jump_desktop_modifiers: u32` (default Alt)
 
 **Invariant:** in `load()`, if `cycle_taskbar_based` is true then `uncombine_mode` is forced to true.
