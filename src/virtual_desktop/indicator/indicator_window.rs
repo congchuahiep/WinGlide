@@ -73,9 +73,9 @@ struct State {
     hover: Cell<Option<usize>>,
     move_mode: Cell<bool>,
     move_target: Cell<Option<MoveTarget>>,
-    /// Whether the indicator window is currently hidden, for any reason: an
-    /// auto-hidden taskbar, a fullscreen app on the taskbar's monitor, or the
-    /// tray-icon mode.
+    /// Whether the indicator window is currently hidden, for any
+    /// reason: an auto-hidden taskbar, a fullscreen app on the taskbar's monitor,
+    /// or the taskbar dots being switched off.
     hidden: Cell<bool>,
     /// The app window that owns the taskbar's monitor, when one does. The dots
     /// hide while this is set, because the bar is covered by that app and the
@@ -567,9 +567,9 @@ impl State {
         let Ok(settings) = self.settings.lock().map(|s| *s) else {
             return;
         };
-        if settings.mode.is_tray() {
-            // The notification area carries the desktop number instead. Hide the
-            // dot window so it cannot sit over the taskbar's buttons.
+        if !settings.dots {
+            // Only the tray badge is on: the window stays alive because it owns the
+            // virtual-desktop event thread, but it must not paint over the taskbar.
             unsafe {
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }

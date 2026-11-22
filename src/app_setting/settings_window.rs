@@ -4,9 +4,9 @@
 //! Also owns the IPC helper that pokes the background app to reload its config
 //! and the process job object that ties the UI process to the background one.
 
-use crate::app_setting::AppConfig;
 use crate::app_setting::hotkey_button;
 use crate::app_setting::setting_item::{setting_item, SettingItemProps};
+use crate::app_setting::AppConfig;
 use std::os::windows::io::AsRawHandle;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::JobObjects::{
@@ -305,35 +305,24 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
         ..Default::default()
     });
 
-    // Indicator mode: dots on the taskbar, or the desktop number in the tray icon.
-    let mode_label = match config.indicator_mode {
-        2 => "Tray icon",
-        _ => "Taskbar dots",
-    };
-    let mode_action: Element = drop_down_button(mode_label)
-        .menu_flyout(vec![menu_item("Taskbar dots"), menu_item("Tray icon")])
-        .on_flyout_item_click({
+    // Tray badge: the desktop number drawn on the notification-area icon. It is a
+    // setting of its own, independent of the on-taskbar dots.
+    let tray_badge_action: Element = ToggleSwitch::new(config.tray_badge)
+        .on_content("")
+        .off_content("")
+        .min_width(0.0)
+        .width(42.)
+        .on_changed({
             let set_config = set_config.clone();
-            move |text: String| {
-                let new_mode = match text.as_str() {
-                    "Tray icon" => 2,
-                    _ => 0,
-                };
+            move |checked| {
                 let mut new_config = crate::app_setting::AppConfig::load();
-                if new_mode == new_config.indicator_mode {
-                    return;
-                }
-                new_config.indicator_mode = new_mode;
+                new_config.tray_badge = checked;
                 new_config.save();
                 set_config.call(new_config);
                 send_reload_signal();
             }
         })
         .into();
-    let mode_action = mode_action.margin(Thickness {
-        right: 10.,
-        ..Default::default()
-    });
 
     let accent_action: Element = ToggleSwitch::new(config.indicator_accent_color)
         .on_content("")
@@ -401,19 +390,9 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
                     icon: None,
                     title: None,
                     description: Some(
-                        "Click a dot to switch to that desktop. Hold Alt + click to move the current window there. Right-click a dot to open a 'Move to Desktop' menu.".into(),
+                        "Click a dot to switch to that desktop. Hold Alt + click to move the current window there. Right-click a dot to open a 'Move to Desktop' menu".into(),
                     ),
                     action: None,
-                    children: None,
-                    always_expand: false,
-                    enabled: config.desktop_indicator,
-                }, SettingItemProps {
-                    icon: None,
-                    title: Some("Mode".into()),
-                    description: Some(
-                        "Draw the dots on the taskbar, or show the current desktop number in the notification area".into(),
-                    ),
-                    action: Some(mode_action.into()),
                     children: None,
                     always_expand: false,
                     enabled: config.desktop_indicator,
@@ -424,17 +403,17 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
                     action: Some(position_action.into()),
                     children: None,
                     always_expand: false,
-                    enabled: config.desktop_indicator && config.indicator_mode != 2,
+                    enabled: config.desktop_indicator,
                 }, SettingItemProps {
                     icon: None,
                     title: Some("Accent Color".into()),
                     description: Some(
-                        "Use the Windows accent color for the dots instead of the theme color".into(),
+                        "Use the Windows accent color for the dots".into(),
                     ),
                     action: Some(accent_action),
                     children: None,
                     always_expand: false,
-                    enabled: config.desktop_indicator && config.indicator_mode != 2,
+                    enabled: config.desktop_indicator,
                 }, SettingItemProps {
                     icon: None,
                     title: Some("Background".into()),
@@ -442,9 +421,23 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
                     action: Some(background_action),
                     children: None,
                     always_expand: false,
-                    enabled: config.desktop_indicator && config.indicator_mode != 2,
+                    enabled: config.desktop_indicator,
                 }]),
                 always_expand: true,
+                enabled: true,
+            },
+            cx,
+        ),
+        setting_item(
+            &SettingItemProps {
+                icon: Some('\u{EC1B}'),
+                title: Some("Tray Icon Badge".into()),
+                description: Some(
+                    "Draw the current desktop number on the tray icon".into(),
+                ),
+                action: Some(tray_badge_action),
+                children: None,
+                always_expand: false,
                 enabled: true,
             },
             cx,
@@ -467,8 +460,7 @@ fn virtual_desktop_settings(cx: &mut RenderCx) -> Element {
 }
 
 fn system_settings(cx: &mut RenderCx) -> Element {
-    let (autostart, set_autostart) =
-        cx.use_state(crate::app::autostart::is_autostart_enabled());
+    let (autostart, set_autostart) = cx.use_state(crate::app::autostart::is_autostart_enabled());
 
     vstack((
         body_strong("System").margin(Thickness {

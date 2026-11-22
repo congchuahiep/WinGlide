@@ -33,11 +33,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub indicator_position: u8,
 
-    /// Where the Desktop Indicator is drawn: 0 = dots on the taskbar, 2 = the
-    /// desktop number in the notification-area icon (1 is reserved for the
-    /// automatic fallback that is not implemented yet)
+    /// Draw the current desktop number on the tray icon. Independent of
+    /// `desktop_indicator`, so both can be on at the same time.
     #[serde(default)]
-    pub indicator_mode: u8,
+    pub tray_badge: bool,
 
     /// Paint the Desktop Indicator dots with the Windows accent color
     #[serde(default = "default_true")]
@@ -68,7 +67,7 @@ impl Default for AppConfig {
             hotkey_right_modifiers: MOD_ALT.0 as u32,
             desktop_indicator: true,
             indicator_position: 0, // Auto
-            indicator_mode: 0,     // Taskbar dots
+            tray_badge: false,
             indicator_accent_color: true,
             indicator_background: true,
             jump_desktop_modifiers: MOD_ALT.0 as u32,
@@ -96,6 +95,7 @@ impl AppConfig {
                     if config.cycle_taskbar_based {
                         config.uncombine_mode = true;
                     }
+                    config.migrate_legacy_indicator_mode(&content);
                     config
                 }
                 Err(e) => {
@@ -109,6 +109,29 @@ impl AppConfig {
                 default_config
             }
         }
+    }
+
+    /// Configs written before the tray badge became its own setting stored the
+    /// choice in `indicator_mode` (2 meant the number went to the tray icon and
+    /// the dots were not used). Carry that over once: the field no longer
+    /// exists, so the next save drops it.
+    fn migrate_legacy_indicator_mode(&mut self, content: &str) {
+        #[derive(Deserialize)]
+        struct Legacy {
+            indicator_mode: Option<u8>,
+        }
+
+        let Ok(legacy) = serde_json::from_str::<Legacy>(content) else {
+            return;
+        };
+        if legacy.indicator_mode != Some(2) {
+            return;
+        }
+
+        self.desktop_indicator = false;
+        self.tray_badge = true;
+        self.save();
+        tracing::info!("config: migrated indicator_mode = 2 to tray_badge = true");
     }
 
     /// Save the current configuration to the file.

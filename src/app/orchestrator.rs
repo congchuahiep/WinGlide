@@ -29,7 +29,7 @@ use crate::app_setting;
 use crate::taskbar::{CycleDirection, TaskbarEnumerator, UncombineManager};
 use crate::tray::{TrayIcon, IDM_EXIT, IDM_SETTINGS, IDM_SHOW_CONSOLE};
 use crate::virtual_desktop::indicator::{
-    current_desktop_number, IndicatorMode, IndicatorSettings, IndicatorWindow,
+    current_desktop_number, IndicatorSettings, IndicatorWindow,
 };
 use crate::window::activate::force_activate;
 use crate::window::context::WindowContext;
@@ -125,7 +125,8 @@ pub struct App {
     indicator_window: Option<IndicatorWindow>,
 
     /// Where the desktop indicator is drawn: dots on the taskbar or the tray icon.
-    indicator_mode: IndicatorMode,
+    /// Keep the current desktop number drawn on the tray icon.
+    tray_badge: bool,
 
     /// Remaining [`TIMER_TRAY_RESYNC`] ticks of the post-change tray icon re-check.
     tray_resync_ticks: u32,
@@ -148,15 +149,14 @@ impl App {
         let uncombine_manager = Box::new(UncombineManager::new());
         let mut tray_icon = TrayIcon::create();
         let hidden_window = Self::create_hidden_window()?;
-        let indicator_mode = IndicatorMode::from_u8(config.indicator_mode);
 
         unsafe {
             WM_TASKBARCREATED = RegisterWindowMessageW(w!("TaskbarCreated"));
         }
 
-        // In tray mode the icon itself shows the desktop number; set it before
-        // registering so the very first icon the shell draws is already right.
-        if config.desktop_indicator && indicator_mode.is_tray() {
+        // The tray badge is an independent setting: show the number before the icon
+        // is registered, so the very first icon the shell draws is already right.
+        if config.tray_badge {
             tray_icon.set_badge(Some(current_desktop_number()));
         }
 
@@ -184,7 +184,7 @@ impl App {
             tray_icon,
             hidden_window,
             indicator_window,
-            indicator_mode,
+            tray_badge: config.tray_badge,
             tray_resync_ticks: 0,
         })
     }
@@ -286,7 +286,7 @@ impl App {
             // The indicator thread saw a virtual-desktop switch. In tray mode the
             // icon itself is the indicator, so repaint its number.
             WM_APP_DESKTOP_CHANGED => {
-                if self.indicator_mode.is_tray() && self.indicator_window.is_some() {
+                if self.tray_badge {
                     self.tray_icon.set_badge(Some(wparam.0.max(1)));
                 }
                 Some(LRESULT(0))
@@ -487,7 +487,7 @@ impl App {
     fn handle_reload_config(&mut self) {
         info!("Reloading configuration...");
         let config = AppConfig::load();
-        self.indicator_mode = IndicatorMode::from_u8(config.indicator_mode);
+        self.tray_badge = config.tray_badge;
 
         self.uncombine_enabled
             .store(config.uncombine_mode, Ordering::SeqCst);
@@ -504,7 +504,9 @@ impl App {
         self.key_hook
             .set_hotkeys(&self.hotkey_manager.low_level_hotkeys());
 
-        if config.desktop_indicator {
+        // The dot window also owns the virtual-desktop event thread, so it has to
+        // exist while the tray badge is on even when the dots themselves are off.
+        if config.desktop_indicator || config.tray_badge {
             let settings = IndicatorSettings::from_config(&config);
             match &mut self.indicator_window {
                 Some(ind) => ind.set_config(settings),
@@ -522,9 +524,9 @@ impl App {
             self.indicator_window = None;
         }
 
-        // In tray mode the notification-area icon is the indicator: show the
-        // number while it is enabled, and restore the plain glyph otherwise.
-        let badge = if config.desktop_indicator && self.indicator_mode.is_tray() {
+        // The tray badge is its own setting: show the number while it is on and
+        // restore the plain glyph otherwise.
+        let badge = if config.tray_badge {
             Some(current_desktop_number())
         } else {
             None

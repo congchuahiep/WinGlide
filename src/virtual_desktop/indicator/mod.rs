@@ -22,18 +22,16 @@ mod desktop_mover;
 mod dot_painter;
 mod fullscreen_detector;
 mod indicator_geometry;
-mod indicator_mode;
 mod indicator_position;
 mod indicator_settings;
 mod indicator_window;
 mod taskbar_watcher;
 mod utils;
 
-pub use indicator_mode::IndicatorMode;
 pub use indicator_settings::IndicatorSettings;
 pub use indicator_window::IndicatorWindow;
 
-/// 1-based number of the active virtual desktop, for the tray-icon mode.
+/// 1-based number of the active virtual desktop, for the tray-icon badge.
 pub fn current_desktop_number() -> usize {
     utils::current_index() + 1
 }
