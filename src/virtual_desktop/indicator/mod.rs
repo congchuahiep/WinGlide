@@ -13,12 +13,14 @@
 //! * `DotPainter`        - paints the dots and hover highlights onto a `Canvas`.
 //! * `DesktopMover`      - "move window to desktop" actions and their context menu.
 //! * `IndicatorGeometry` - dot size/length and where the window is placed.
+//! * `FullscreenDetector` - the fullscreen app that owns the taskbar's monitor.
 //! * `Canvas`            - logical 32-bit ARGB drawing surface.
 //! * `utils`             - small helpers over the winvd API.
 
 mod canvas;
 mod desktop_mover;
 mod dot_painter;
+mod fullscreen_detector;
 mod indicator_geometry;
 mod indicator_mode;
 mod indicator_position;
@@ -43,6 +45,10 @@ const WM_APP_VD_EVENT: u32 = WM_USER + 0x100;
 
 /// Posted to the indicator window when the taskbar changes position (slide hide/unhide).
 const WM_APP_TASKBAR_MOVED: u32 = WM_USER + 0x101;
+
+/// Posted to the indicator window when the foreground window changed, which may
+/// have started or ended a fullscreen app on the taskbar's monitor.
+const WM_APP_FULLSCREEN_CHANGED: u32 = WM_USER + 0x102;
 
 /// Gap kept between the indicator and the taskbar edge / system tray.
 const INDICATOR_MARGIN: i32 = 6;

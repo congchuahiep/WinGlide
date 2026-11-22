@@ -3,9 +3,10 @@
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::slice::from_raw_parts_mut;
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use windows::core::w;
 use windows::Win32::Foundation::*;
@@ -18,18 +19,27 @@ use windows::Win32::UI::WindowsAndMessaging::{self, *};
 use super::canvas::Canvas;
 use super::desktop_mover::{DesktopMover, MoveTarget};
 use super::dot_painter::DotPainter;
+use super::fullscreen_detector::FullscreenDetector;
 use super::indicator_geometry::{hovered_dot, IndicatorGeometry};
 use super::indicator_settings::IndicatorSettings;
 use super::taskbar_watcher::TaskbarWatcher;
 use super::utils;
-use super::{MENU_MOVE_BASE, WM_APP_TASKBAR_MOVED, WM_APP_VD_EVENT};
+use super::{MENU_MOVE_BASE, WM_APP_FULLSCREEN_CHANGED, WM_APP_TASKBAR_MOVED, WM_APP_VD_EVENT};
 use crate::taskbar::Taskbar;
 
-/// Timer id for the periodic "am I still above the taskbar's other children" check.
-const TIMER_Z_ORDER: usize = 1;
-/// How often that check runs. It is a single `GetWindow` call and only acts when
-/// Explorer re-stacked the taskbar's children.
-const Z_ORDER_CHECK_MS: u32 = 1500;
+/// How long the app waits for the indicator thread to report its window.
+///
+/// Creating the window takes milliseconds; the bound exists so that a thread stuck
+/// before it reports cannot freeze the message loop that serves the hotkeys and the
+/// tray icon.
+const READY_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long `Drop` waits for the indicator thread to finish.
+///
+/// Same reasoning as [`READY_TIMEOUT`]: the thread can be stuck inside a call into
+/// a restarting Explorer, and it must never freeze the message loop that serves the
+/// hotkeys and the tray icon.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Indicator window displaying virtual-desktop status on the taskbar.
 ///
@@ -47,6 +57,9 @@ pub struct IndicatorWindow {
     /// Settings shared with the indicator thread.
     settings: Arc<Mutex<IndicatorSettings>>,
     thread: Option<JoinHandle<()>>,
+    /// Signalled when the indicator thread is about to end; `Drop` waits on this
+    /// with a bound instead of joining blindly.
+    stopped: mpsc::Receiver<()>,
     _desktop_event_thread: Option<winvd::DesktopEventThread>,
 }
 
@@ -60,8 +73,17 @@ struct State {
     hover: Cell<Option<usize>>,
     move_mode: Cell<bool>,
     move_target: Cell<Option<MoveTarget>>,
-    /// Tracks whether the indicator is currently hidden due to taskbar autohide.
-    taskbar_hidden: Cell<bool>,
+    /// Whether the indicator window is currently hidden, for any reason: an
+    /// auto-hidden taskbar, a fullscreen app on the taskbar's monitor, or the
+    /// tray-icon mode.
+    hidden: Cell<bool>,
+    /// The app window that owns the taskbar's monitor, when one does. The dots
+    /// hide while this is set, because the bar is covered by that app and the
+    /// dots would paint over it.
+    fullscreen: Cell<Option<HWND>>,
+    /// Watches foreground changes that can start or end a fullscreen app. Held
+    /// for its `Drop`, which unhooks the event hook.
+    _detector: Option<FullscreenDetector>,
     /// Last known taskbar rect, to avoid redundant re-renders when the bar has not moved.
     last_taskbar_rect: Cell<Option<RECT>>,
     /// Hidden top-level window that owns the right-click menu (see
@@ -90,20 +112,31 @@ impl IndicatorWindow {
 
         let settings = Arc::new(Mutex::new(settings));
         let (ready_tx, ready_rx) = mpsc::channel::<Result<isize, String>>();
+        let (stopped_tx, stopped_rx) = mpsc::channel::<()>();
         let thread_settings = Arc::clone(&settings);
         let thread = std::thread::Builder::new()
             .name("indicator".into())
-            .spawn(move || unsafe { run_indicator_thread(thread_settings, ready_tx) })?;
+            .spawn(move || {
+                unsafe { run_indicator_thread(thread_settings, ready_tx) };
+                // Lets `Drop` tell "finished" apart from "still running".
+                let _ = stopped_tx.send(());
+            })?;
 
-        let hwnd = match ready_rx.recv() {
+        let hwnd = match ready_rx.recv_timeout(READY_TIMEOUT) {
             Ok(Ok(handle)) => HWND(handle as *mut _),
             Ok(Err(e)) => {
                 let _ = thread.join();
                 anyhow::bail!("indicator window: {e}");
             }
-            Err(e) => {
+            Err(RecvTimeoutError::Disconnected) => {
                 let _ = thread.join();
-                anyhow::bail!("indicator thread stopped: {e}");
+                anyhow::bail!("indicator thread stopped before reporting its window");
+            }
+            // The thread is stuck before it could report. Detach it rather than
+            // joining it: a frozen indicator must not take the whole app with it.
+            Err(RecvTimeoutError::Timeout) => {
+                drop(thread);
+                anyhow::bail!("indicator thread did not report ready in {READY_TIMEOUT:?}");
             }
         };
 
@@ -111,6 +144,7 @@ impl IndicatorWindow {
             hwnd,
             settings,
             thread: Some(thread),
+            stopped: stopped_rx,
             _desktop_event_thread: None,
         })
     }
@@ -190,7 +224,14 @@ impl IndicatorWindow {
                 s.sync_taskbar(hwnd);
                 // `refresh()` reuses this message for theme/DPI changes, where
                 // the taskbar did not move but the dots still need a repaint.
-                if !s.taskbar_hidden.get() {
+                if !s.hidden.get() {
+                    s.render(hwnd);
+                }
+                LRESULT(0)
+            }
+            (WM_APP_FULLSCREEN_CHANGED, Some(s)) => {
+                FullscreenDetector::reset_pending();
+                if s.refresh_fullscreen() {
                     s.render(hwnd);
                 }
                 LRESULT(0)
@@ -221,10 +262,6 @@ impl IndicatorWindow {
                 s.on_rbutton_up(x, y)
             }
             (WM_COMMAND, Some(s)) => s.on_command(wparam),
-            (WM_TIMER, Some(s)) if wparam.0 == TIMER_Z_ORDER => {
-                s.keep_on_top(hwnd);
-                LRESULT(0)
-            }
             // The message loop of the indicator thread exits here; the owning
             // `IndicatorWindow` is then joined by its `Drop`.
             (WM_DESTROY, _) => {
@@ -257,11 +294,24 @@ impl IndicatorWindow {
 impl Drop for IndicatorWindow {
     fn drop(&mut self) {
         // The window belongs to the indicator thread. Ask it to close
-        // (DefWindowProc destroys the window, WM_DESTROY quits the loop) and
-        // wait for that thread to drop the window state.
+        // (DefWindowProc destroys the window, WM_DESTROY quits the loop) and wait
+        // for that thread to drop the window state.
         let _ = unsafe { PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+
+        // Never join blindly: the thread can be stuck inside a call into a
+        // restarting Explorer, and this thread owns the hotkeys and the tray icon.
+        match self.stopped.recv_timeout(SHUTDOWN_TIMEOUT) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                if let Some(thread) = self.thread.take() {
+                    let _ = thread.join();
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                tracing::warn!(
+                    "indicator thread did not stop within {SHUTDOWN_TIMEOUT:?}; leaving it behind"
+                );
+                drop(self.thread.take());
+            }
         }
     }
 }
@@ -289,9 +339,14 @@ unsafe fn run_indicator_thread(
     match create_indicator_window(settings) {
         Ok((hwnd, state)) => {
             let _ = ready.send(Ok(hwnd.0 as isize));
+            // First paint happens after the owner has the handle, so a slow check
+            // can never hold up the app that is waiting for `ready`.
+            state.initial_paint(hwnd);
             run_message_loop();
+            tracing::debug!("indicator thread: message loop exited");
             // Drops the menu owner window and unhooks the taskbar watcher.
             drop(state);
+            tracing::debug!("indicator thread: window state released");
         }
         Err(e) => {
             let _ = ready.send(Err(e.to_string()));
@@ -345,17 +400,15 @@ unsafe fn create_indicator_window(
     )?;
     reparent_to_taskbar(hwnd, taskbar.hwnd());
 
-    // Safety net for shell re-layouts: if Explorer ever puts its XAML content
-    // bridge back above the dots, the next tick restores the order.
-    SetTimer(Some(hwnd), TIMER_Z_ORDER, Z_ORDER_CHECK_MS, None);
-
     let menu_host = DesktopMover::create_menu_host(hwnd);
     let watcher = TaskbarWatcher::new(hwnd, taskbar.hwnd());
+    let detector = FullscreenDetector::new(hwnd);
     let mut state = Box::new(State::new(
         settings,
         taskbar.is_hidden(),
         menu_host,
         watcher,
+        detector,
     ));
     SetWindowLongPtrW(
         hwnd,
@@ -363,10 +416,8 @@ unsafe fn create_indicator_window(
         Box::as_mut(&mut state) as *mut State as isize,
     );
 
-    if !state.taskbar_hidden.get() {
-        state.render(hwnd);
-    }
-
+    // A fullscreen app may already own the monitor when the indicator is created
+    // (the user enabled it from Settings while a game was up).
     Ok((hwnd, state))
 }
 
@@ -385,17 +436,55 @@ impl State {
         initially_hidden: bool,
         menu_host: HWND,
         watcher: Option<TaskbarWatcher>,
+        detector: Option<FullscreenDetector>,
     ) -> Self {
         Self {
             settings,
             hover: Cell::new(None),
             move_mode: Cell::new(false),
             move_target: Cell::new(None),
-            taskbar_hidden: Cell::new(initially_hidden),
+            hidden: Cell::new(initially_hidden),
+            fullscreen: Cell::new(None),
+            _detector: detector,
             last_taskbar_rect: Cell::new(None),
             menu_host,
             watcher,
         }
+    }
+
+    /// First paint: evaluate the fullscreen state, then draw unless something
+    /// hides the dots.
+    ///
+    /// Runs on the indicator thread once its owner holds the window handle, so a
+    /// slow check cannot delay the app's start-up handshake.
+    fn initial_paint(&self, hwnd: HWND) {
+        self.refresh_fullscreen();
+        if !self.hidden.get() {
+            self.render(hwnd);
+        }
+    }
+
+    /// Re-evaluates which app, if any, owns the taskbar's monitor.
+    ///
+    /// Returns `true` when the answer changed; the caller then re-renders, which
+    /// either hides the dots or brings them back. The detector keeps the window
+    /// handle across checks so a floating popup cannot make the dots flicker.
+    fn refresh_fullscreen(&self) -> bool {
+        let previous = self.fullscreen.get();
+        let next = Taskbar::primary()
+            .and_then(|taskbar| FullscreenDetector::active(&taskbar, previous));
+        if next == previous {
+            return false;
+        }
+        match next {
+            Some(app) => tracing::debug!(
+                "indicator hidden: fullscreen app 0x{:X} owns the taskbar monitor",
+                app.0 as isize
+            ),
+            None => tracing::debug!("indicator: no fullscreen app on the taskbar monitor"),
+        }
+        self.fullscreen.set(next);
+        true
     }
 
     /// Syncs indicator visibility, position and parent against the current
@@ -403,20 +492,21 @@ impl State {
     ///
     /// If the taskbar is auto-hidden off-screen, the indicator hides (`SW_HIDE`).
     /// When the taskbar reappears, moves, or was recreated by Explorer, the
-    /// indicator re-parents and draws itself again.
+    /// indicator re-parents and draws itself again - unless a fullscreen app owns
+    /// the monitor, which [`Self::render`] then refuses to paint over.
     fn sync_taskbar(&self, hwnd: HWND) {
         unsafe {
             let Some(taskbar) = Taskbar::primary() else {
-                if !self.taskbar_hidden.get() {
+                if !self.hidden.get() {
                     let _ = ShowWindow(hwnd, SW_HIDE);
-                    self.taskbar_hidden.set(true);
+                    self.hidden.set(true);
                 }
                 return;
             };
 
             let is_hidden = taskbar.is_hidden();
             let rect = taskbar.rect();
-            let was_hidden = self.taskbar_hidden.get();
+            let was_hidden = self.hidden.get();
             let last_rect = self.last_taskbar_rect.get();
             let reattached = self.attach(hwnd, taskbar.hwnd());
             if let Some(watcher) = &self.watcher {
@@ -426,7 +516,7 @@ impl State {
             if is_hidden {
                 if !was_hidden {
                     let _ = ShowWindow(hwnd, SW_HIDE);
-                    self.taskbar_hidden.set(true);
+                    self.hidden.set(true);
                 }
             } else if was_hidden || reattached || Some(rect) != last_rect {
                 self.render(hwnd);
@@ -471,30 +561,6 @@ impl State {
         }
     }
 
-    /// Puts the dots back above the taskbar's other children when something
-    /// ended up over them.
-    ///
-    /// Explorer's XAML content bridge is a full-size sibling of the indicator,
-    /// and a shell re-layout can raise it again. The check is one `GetWindow`
-    /// call and does nothing while the order is already right.
-    fn keep_on_top(&self, hwnd: HWND) {
-        unsafe {
-            // `Err` means "no window above me", i.e. the order is already right.
-            if GetWindow(hwnd, GW_HWNDPREV).is_err() {
-                return;
-            }
-            let _ = SetWindowPos(
-                hwnd,
-                Some(HWND_TOP),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
-        }
-    }
-
     /// Renders the dots into a 32-bit ARGB bitmap and pushes it to the screen
     /// with `UpdateLayeredWindow`.
     fn render(&self, hwnd: HWND) {
@@ -507,20 +573,31 @@ impl State {
             unsafe {
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }
-            self.taskbar_hidden.set(true);
+            self.hidden.set(true);
+            return;
+        }
+
+        if self.fullscreen.get().is_some() {
+            // A fullscreen app owns the bar's monitor. Hide instead of skipping the
+            // paint: any scheduled repaint (a desktop switch, a theme change, the
+            // taskbar sliding back in) must not bring the dots up over that app.
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            self.hidden.set(true);
             return;
         }
 
         unsafe {
             let Some(taskbar) = Taskbar::primary() else {
                 let _ = ShowWindow(hwnd, SW_HIDE);
-                self.taskbar_hidden.set(true);
+                self.hidden.set(true);
                 return;
             };
 
             if taskbar.is_hidden() {
                 let _ = ShowWindow(hwnd, SW_HIDE);
-                self.taskbar_hidden.set(true);
+                self.hidden.set(true);
                 return;
             }
 
@@ -616,7 +693,7 @@ impl State {
                     ULW_ALPHA,
                 );
 
-                self.taskbar_hidden.set(false);
+                self.hidden.set(false);
 
                 SelectObject(mem_dc, old_bmp);
                 let _ = DeleteObject(HGDIOBJ(bmp.0 as _));
@@ -631,7 +708,7 @@ impl State {
         // Remember the window the user was working in while the pointer is still
         // only hovering: the click itself clears the foreground window.
         DesktopMover::capture_foreground();
-        if self.taskbar_hidden.get() {
+        if self.hidden.get() {
             return LRESULT(0);
         }
         let hovered = hovered_dot(x, y);

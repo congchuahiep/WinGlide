@@ -349,15 +349,18 @@ impl App {
                 // that no longer exists. Re-attach the survivor, rebuild the rest.
                 if let Some(ind) = self.indicator_window.take() {
                     if ind.is_alive() {
+                        debug!("TaskbarCreated: indicator window survived, refreshing it");
                         ind.refresh();
                         self.indicator_window = Some(ind);
                     } else {
+                        debug!("TaskbarCreated: rebuilding the indicator window");
                         drop(ind);
                         unsafe {
                             let settings = IndicatorSettings::from_config(&AppConfig::load());
                             match IndicatorWindow::new(settings) {
                                 Ok(mut rebuilt) => {
                                     rebuilt.run();
+                                    debug!("TaskbarCreated: indicator window rebuilt");
                                     self.indicator_window = Some(rebuilt);
                                 }
                                 Err(e) => error!("Failed to recreate IndicatorWindow: {e}"),

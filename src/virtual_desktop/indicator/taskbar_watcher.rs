@@ -11,8 +11,9 @@ use tracing::debug;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowThreadProcessId, PostMessageW, EVENT_OBJECT_LOCATIONCHANGE, INDEXID_CONTAINER,
-    OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    GetWindowThreadProcessId, PostMessageW, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
+    EVENT_OBJECT_SHOW, INDEXID_CONTAINER, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS,
 };
 
 use super::WM_APP_TASKBAR_MOVED;
@@ -21,10 +22,49 @@ static TARGET_TASKBAR_HWND: AtomicIsize = AtomicIsize::new(0);
 static INDICATOR_HWND: AtomicIsize = AtomicIsize::new(0);
 static SYNC_PENDING: AtomicBool = AtomicBool::new(false);
 
-/// RAII wrapper around a `HWINEVENTHOOK` for taskbar location changes.
+/// The WinEvent ranges the watcher listens to, all filtered to the shell's process.
+///
+/// The bar sliding for auto-hide reports a location change; the bar coming back
+/// from a fullscreen app reports a **show**, which carries no location change at
+/// all. Without that second range the dots stayed hidden until something else
+/// happened to move the bar.
+const WATCHED_EVENTS: [(u32, u32); 2] = [
+    (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
+    (EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE),
+];
+
+/// RAII wrapper around the hooks that watch the taskbar for movement and for being
+/// shown again.
 pub(super) struct TaskbarWatcher {
-    hook: Mutex<HWINEVENTHOOK>,
+    hooks: Mutex<Vec<HWINEVENTHOOK>>,
     taskbar_hwnd: AtomicIsize,
+}
+
+/// Installs one hook per watched range for the shell's process `pid`.
+fn install_hooks(pid: u32) -> Vec<HWINEVENTHOOK> {
+    WATCHED_EVENTS
+        .iter()
+        .map(|&(min, max)| unsafe {
+            SetWinEventHook(
+                min,
+                max,
+                None,
+                Some(taskbar_event_proc),
+                pid,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            )
+        })
+        .filter(|hook| !hook.is_invalid())
+        .collect()
+}
+
+fn unhook_all(hooks: &[HWINEVENTHOOK]) {
+    for hook in hooks {
+        unsafe {
+            let _ = UnhookWinEvent(*hook);
+        }
+    }
 }
 
 impl TaskbarWatcher {
@@ -39,25 +79,15 @@ impl TaskbarWatcher {
             GetWindowThreadProcessId(taskbar_hwnd, Some(&mut pid));
         }
 
-        let hook = unsafe {
-            SetWinEventHook(
-                EVENT_OBJECT_LOCATIONCHANGE,
-                EVENT_OBJECT_LOCATIONCHANGE,
-                None,
-                Some(taskbar_location_proc),
-                pid,
-                0,
-                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-            )
-        };
+        let hooks = install_hooks(pid);
 
-        if hook.is_invalid() {
-            debug!("Failed to install TaskbarWatcher hook");
+        if hooks.is_empty() {
+            debug!("Failed to install TaskbarWatcher hooks");
             None
         } else {
-            debug!("TaskbarWatcher hook installed for PID {}", pid);
+            debug!("TaskbarWatcher hooks installed for PID {}", pid);
             Some(Self {
-                hook: Mutex::new(hook),
+                hooks: Mutex::new(hooks),
                 taskbar_hwnd: AtomicIsize::new(taskbar_hwnd.0 as isize),
             })
         }
@@ -66,12 +96,8 @@ impl TaskbarWatcher {
     /// Re-installs the hook if the taskbar HWND has changed (e.g. after Explorer restart).
     pub(super) fn update_taskbar(&self, indicator_hwnd: HWND, new_taskbar_hwnd: HWND) {
         if self.taskbar_hwnd.load(Ordering::Relaxed) != new_taskbar_hwnd.0 as isize {
-            if let Ok(mut hook_guard) = self.hook.lock() {
-                unsafe {
-                    if !hook_guard.is_invalid() {
-                        let _ = UnhookWinEvent(*hook_guard);
-                    }
-                }
+            if let Ok(mut hooks) = self.hooks.lock() {
+                unhook_all(&hooks);
                 INDICATOR_HWND.store(indicator_hwnd.0 as isize, Ordering::SeqCst);
                 TARGET_TASKBAR_HWND.store(new_taskbar_hwnd.0 as isize, Ordering::SeqCst);
                 SYNC_PENDING.store(false, Ordering::SeqCst);
@@ -81,22 +107,10 @@ impl TaskbarWatcher {
                     GetWindowThreadProcessId(new_taskbar_hwnd, Some(&mut pid));
                 }
 
-                let new_hook = unsafe {
-                    SetWinEventHook(
-                        EVENT_OBJECT_LOCATIONCHANGE,
-                        EVENT_OBJECT_LOCATIONCHANGE,
-                        None,
-                        Some(taskbar_location_proc),
-                        pid,
-                        0,
-                        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-                    )
-                };
-
-                *hook_guard = new_hook;
+                *hooks = install_hooks(pid);
                 self.taskbar_hwnd
                     .store(new_taskbar_hwnd.0 as isize, Ordering::SeqCst);
-                debug!("TaskbarWatcher hook updated for new PID {}", pid);
+                debug!("TaskbarWatcher hooks updated for new PID {}", pid);
             }
         }
     }
@@ -109,12 +123,8 @@ impl TaskbarWatcher {
 
 impl Drop for TaskbarWatcher {
     fn drop(&mut self) {
-        if let Ok(hook_guard) = self.hook.lock() {
-            unsafe {
-                if !hook_guard.is_invalid() {
-                    let _ = UnhookWinEvent(*hook_guard);
-                }
-            }
+        if let Ok(hooks) = self.hooks.lock() {
+            unhook_all(&hooks);
         }
         TARGET_TASKBAR_HWND.store(0, Ordering::SeqCst);
         INDICATOR_HWND.store(0, Ordering::SeqCst);
@@ -123,8 +133,8 @@ impl Drop for TaskbarWatcher {
     }
 }
 
-/// Static callback invoked by Windows when a window in the Explorer process moves or resizes.
-unsafe extern "system" fn taskbar_location_proc(
+/// Static callback invoked by Windows when the taskbar moves or is shown/hidden.
+unsafe extern "system" fn taskbar_event_proc(
     _hook: HWINEVENTHOOK,
     event: u32,
     hwnd: HWND,
@@ -133,7 +143,10 @@ unsafe extern "system" fn taskbar_location_proc(
     _event_thread: u32,
     _event_time: u32,
 ) {
-    if event != EVENT_OBJECT_LOCATIONCHANGE {
+    if !matches!(
+        event,
+        EVENT_OBJECT_LOCATIONCHANGE | EVENT_OBJECT_SHOW | EVENT_OBJECT_HIDE
+    ) {
         return;
     }
     if id_object != OBJID_WINDOW.0 || id_child != INDEXID_CONTAINER as i32 {
@@ -150,8 +163,8 @@ unsafe extern "system" fn taskbar_location_proc(
         let ind = INDICATOR_HWND.load(Ordering::Relaxed);
         if ind != 0 {
             tracing::debug!(
-                "Shell_TrayWnd LOCATIONCHANGE – event_time={}ms",
-                _event_time
+                "Shell_TrayWnd event 0x{:X} – event_time={}ms",
+                event, _event_time
             );
 
             let _ = PostMessageW(
