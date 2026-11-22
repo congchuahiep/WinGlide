@@ -14,6 +14,20 @@
 //!
 //! The hook must be installed/uninstalled and its hotkey set updated from the thread
 //! that pumps the message loop (the main thread in [`crate::app::App::run`]).
+//!
+//! # Start menu suppression
+//!
+//! Windows opens the Start menu when a Win key press ends without any other key
+//! press reaching the shell: the shell treats the pair as a lone Win tap. Swallowing
+//! only the combo key's key-down leaves the shell with exactly that picture, so
+//! `Win+1` would switch desktop *and* pop the Start menu on release. A handled
+//! `Win+<key>` combo therefore injects an unassigned "mask" key once per Win hold,
+//! the same trick AHK scripts use (`~LWin::vkE8`).
+//!
+//! Swallowing the Win key-up instead would also keep Start closed, but it leaves the
+//! shell believing Win is still held: every later keystroke is then treated as
+//! `Win+<key>` (Win+F opens Feedback, Win+S opens Search) until Win is tapped again.
+//! The mask key keeps the shell's state balanced.
 
 use std::cell::RefCell;
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
@@ -24,6 +38,9 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 const WM_KEYDOWN: u32 = 0x0100;
 const WM_SYSKEYDOWN: u32 = 0x0104;
+
+/// Unassigned virtual key used to mask a Win hold (AHK's `vkE8`).
+const MASK_VK: VIRTUAL_KEY = VIRTUAL_KEY(0xE8);
 
 /// A hotkey handled by the low-level keyboard hook instead of `RegisterHotKey`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +57,9 @@ pub struct LowLevelHotkey {
 struct HookState {
     hook: Option<HHOOK>,
     hotkeys: Vec<LowLevelHotkey>,
+    /// Set once the mask key was injected during the current Win hold, so
+    /// auto-repeat does not inject it again. See [`hook_proc`].
+    win_masked: bool,
 }
 
 // Registry shared between the manager and the static hook procedure. A `WH_KEYBOARD_LL`
@@ -49,6 +69,7 @@ thread_local! {
     static STATE: RefCell<HookState> = RefCell::new(HookState {
         hook: None,
         hotkeys: Vec::new(),
+        win_masked: false,
     });
 }
 
@@ -74,6 +95,7 @@ impl LowLevelKeyHook {
             if install && state.hook.is_none() {
                 state.hook = Self::install_hook();
             } else if !install {
+                state.win_masked = false;
                 if let Some(h) = state.hook.take() {
                     unsafe {
                         let _ = UnhookWindowsHookEx(h);
@@ -108,6 +130,7 @@ impl Drop for LowLevelKeyHook {
         STATE.with(|s| {
             let mut state = s.borrow_mut();
             state.hotkeys.clear();
+            state.win_masked = false;
             if let Some(h) = state.hook.take() {
                 unsafe {
                     let _ = UnhookWindowsHookEx(h);
@@ -120,6 +143,9 @@ impl Drop for LowLevelKeyHook {
 /// Hook callback: matches key presses against the registered low-level hotkeys,
 /// swallows matches (preventing the native Windows behavior) and posts a `WM_HOTKEY`
 /// message so `App::handle_hotkey` dispatches the action.
+///
+/// A matched `Win+<key>` combo also injects a mask key (see [`inject_mask_key`]) so
+/// the shell does not read the Win release as a lone tap and open the Start menu.
 unsafe extern "system" fn hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
     if n_code >= 0 {
         let msg = w_param.0 as u32;
@@ -128,21 +154,40 @@ unsafe extern "system" fn hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARA
 
             // Ignore synthetic input (the activation ladder taps ALT and can click the
             // taskbar). Reacting to our own injected events would re-enter the hotkey
-            // dispatch and could loop.
+            // dispatch and could loop. The mask key injected below is synthetic too, so
+            // this is also what keeps it from being matched.
             if keyboard.flags.0 & LLKHF_INJECTED.0 != 0 {
                 return CallNextHookEx(None, n_code, w_param, l_param);
             }
 
             let vk = keyboard.vkCode;
-            let matched_id = STATE.with(|s| {
+
+            // A new Win press starts a new hold, which needs its own mask.
+            if is_win_key(vk) {
+                STATE.with(|s| s.borrow_mut().win_masked = false);
+            }
+
+            let matched = STATE.with(|s| {
                 let state = s.borrow();
                 state
                     .hotkeys
                     .iter()
                     .find(|e| e.vk == vk && modifiers_match(e.modifiers))
-                    .map(|e| e.id)
+                    .map(|e| (e.id, e.modifiers))
             });
-            if let Some(id) = matched_id {
+
+            if let Some((id, modifiers)) = matched {
+                if modifiers & MOD_WIN.0 != 0 {
+                    let first_in_hold = STATE.with(|s| {
+                        let mut state = s.borrow_mut();
+                        let first = !state.win_masked;
+                        state.win_masked = true;
+                        first
+                    });
+                    if first_in_hold {
+                        inject_mask_key();
+                    }
+                }
                 // The hook runs on the installing (main) thread, so posting to the
                 // current thread routes through App::dispatch_thread_message.
                 let _ = PostThreadMessageW(
@@ -156,6 +201,35 @@ unsafe extern "system" fn hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARA
         }
     }
     CallNextHookEx(None, n_code, w_param, l_param)
+}
+
+/// Injects a press+release of an unassigned key (`0xE8`) into the input stream.
+///
+/// The mask stands in for the combo key's swallowed key-down, so the shell sees a
+/// keystroke inside the Win hold and stops treating the Win release as a lone tap.
+fn inject_mask_key() {
+    let key = |flags: KEYBD_EVENT_FLAGS| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: MASK_VK,
+                wScan: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let inputs = [key(KEYBD_EVENT_FLAGS(0)), key(KEYEVENTF_KEYUP)];
+
+    let injected = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if injected != inputs.len() as u32 {
+        tracing::debug!(
+            "Mask key injection was blocked ({} of {} events)",
+            injected,
+            inputs.len()
+        );
+    }
 }
 
 /// Returns true when exactly the modifiers in `required` (and none of the other three
@@ -174,4 +248,8 @@ unsafe fn modifiers_match(required: u32) -> bool {
 
 unsafe fn is_key_down(vk: u16) -> bool {
     (GetAsyncKeyState(vk as i32) as u16) & 0x8000 != 0
+}
+
+fn is_win_key(vk: u32) -> bool {
+    vk == VK_LWIN.0 as u32 || vk == VK_RWIN.0 as u32
 }
