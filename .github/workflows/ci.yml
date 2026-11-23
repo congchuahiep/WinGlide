@@ -4,15 +4,15 @@ name: CI
 # creates a tag or a release. The release workflow is deliberately separate so
 # this one can be run as often as needed without leaving anything behind.
 on:
+  # Manual: run it whenever a build needs verifying (this is the normal way for
+  # work that lands directly on main).
   workflow_dispatch:
-  # Automatically only when something that can break runtime staging changes:
-  # a dependency bump, a new build script, or the packaging itself. Source edits
-  # do not affect it, and each run costs a full Windows build of two flavours, so
-  # they are left to `workflow_dispatch`.
-  push:
-    branches:
-      - main
+  # Automatic: only when a pull request touches something this workflow can
+  # actually break - the runtime staging and the packaging. A PR is a review
+  # event, not every commit, so this stays cheap.
+  pull_request:
     paths:
+      - src/**
       - Cargo.toml
       - Cargo.lock
       - build.rs
