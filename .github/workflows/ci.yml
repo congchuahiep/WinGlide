@@ -5,11 +5,14 @@ name: CI
 # this one can be run as often as needed without leaving anything behind.
 on:
   workflow_dispatch:
+  # Automatically only when something that can break runtime staging changes:
+  # a dependency bump, a new build script, or the packaging itself. Source edits
+  # do not affect it, and each run costs a full Windows build of two flavours, so
+  # they are left to `workflow_dispatch`.
   push:
     branches:
       - main
     paths:
-      - src/**
       - Cargo.toml
       - Cargo.lock
       - build.rs
