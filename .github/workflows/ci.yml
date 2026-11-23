@@ -1,0 +1,89 @@
+name: CI
+
+# Verification only: builds all three artefacts and inspects them, but never
+# creates a tag or a release. The release workflow is deliberately separate so
+# this one can be run as often as needed without leaving anything behind.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - src/**
+      - Cargo.toml
+      - Cargo.lock
+      - build.rs
+      - packaging/**
+      - .github/workflows/ci.yml
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Build the MSI/ZIP flavour
+        run: cargo build --release
+
+      # windows-reactor-setup stages the WinUI runtime as a side effect of the
+      # build script. When that staging fails it is easy to miss: the build still
+      # reports success and the artefacts are simply missing 20 MB. Fail here
+      # instead, where the message is clear.
+      - name: Check that the runtime was staged
+        shell: pwsh
+        run: |
+          $runtime = 'target/release/Microsoft.ui.xaml.dll'
+          if (-not (Test-Path $runtime)) {
+            throw 'runtime staging failed: target/release has no Microsoft.ui.xaml.dll'
+          }
+          Write-Output "runtime staged: $((Get-Item $runtime).Length) bytes"
+
+      - name: Run tests
+        run: cargo test
+
+      # The Store package is built by the script itself (its own target directory,
+      # store feature, no updater). Identity comes from the repository secrets when
+      # they exist; otherwise placeholder values are enough to exercise packaging,
+      # because nothing here is installed or signed.
+      - name: Package the Store build
+        shell: pwsh
+        env:
+          MSIX_IDENTITY_NAME: ${{ secrets.MSIX_IDENTITY_NAME || 'WinGlide.ci' }}
+          MSIX_PUBLISHER: ${{ secrets.MSIX_PUBLISHER || 'CN=WinGlide CI' }}
+          MSIX_PUBLISHER_DISPLAY_NAME: ${{ secrets.MSIX_PUBLISHER_DISPLAY_NAME || 'WinGlide CI' }}
+        run: powershell -ExecutionPolicy Bypass -File packaging/build-msix.ps1 -NoSign
+
+      # The check that 0.1.0 needed: an installed package must contain the runtime,
+      # not just an exe and the logos.
+      - name: Check what ended up in the package
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $msix = Get-ChildItem target/msix/*.msix | Select-Object -First 1
+          if (-not $msix) { throw 'no .msix was produced' }
+
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($msix.FullName)
+          $entries = $zip.Entries.Count
+          $runtime = [bool]($zip.Entries | Where-Object { $_.FullName -eq 'Microsoft.ui.xaml.dll' })
+          $zip.Dispose()
+
+          Write-Output "package: $($msix.Name) $($msix.Length) bytes, $entries entries, runtime=$runtime"
+          "Files: $entries" >> $env:GITHUB_STEP_SUMMARY
+          "Runtime included: $runtime" >> $env:GITHUB_STEP_SUMMARY
+
+          if (-not $runtime -or $entries -lt 100) {
+            throw "the package is incomplete: $entries files, runtime=$runtime"
+          }
+
+      - name: Upload the package
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinGlide-ci-msix
+          path: target/msix/*.msix
